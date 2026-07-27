@@ -5,34 +5,60 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
   <title>Journal</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <main class="app">
     <div class="feed" id="feed" aria-live="polite"></div>
     <form class="composer" id="composer">
-      <textarea
-        class="composer-input"
-        id="entry-input"
-        rows="1"
-        placeholder="Write something…"
-        aria-label="Journal entry"
-      ></textarea>
-      <button type="button" class="composer-action" id="paste-btn" aria-label="Paste and submit">
-        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
-          <path fill="currentColor" d="M16 4h-1.18A3 3 0 0 0 12 2a3 3 0 0 0-2.82 2H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2zm-4-1a1 1 0 0 1 1 1h-2a1 1 0 0 1 1-1zm4 17H8V6h2v1a1 1 0 0 0 1 1h2a1 1 0 0 0 1-1V6h2v14z" />
-        </svg>
-      </button>
-      <button type="submit" class="composer-action" aria-label="Send entry">
-        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
-          <path fill="currentColor" d="M12 4l-7 7h4.5v9h5v-9H19z" />
-        </svg>
-      </button>
+      <div class="composer-inner">
+        <textarea
+          class="composer-input"
+          id="entry-input"
+          rows="1"
+          placeholder="Write something…"
+          aria-label="Journal entry"
+        ></textarea>
+        <button type="button" class="composer-action" id="paste-btn" aria-label="Paste and submit">
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+            <path fill="currentColor" d="M16 4h-1.18A3 3 0 0 0 12 2a3 3 0 0 0-2.82 2H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2zm-4-1a1 1 0 0 1 1 1h-2a1 1 0 0 1 1-1zm4 17H8V6h2v1a1 1 0 0 0 1 1h2a1 1 0 0 0 1-1V6h2v14z" />
+          </svg>
+        </button>
+        <button type="submit" class="composer-action" aria-label="Send entry">
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+            <path fill="currentColor" d="M12 4l-7 7h4.5v9h5v-9H19z" />
+          </svg>
+        </button>
+      </div>
     </form>
   </main>
+  <div class="backdate-sheet" id="backdate-sheet" hidden>
+    <div
+      class="backdate-panel"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="backdate-title"
+    >
+      <h2 class="backdate-title" id="backdate-title">Backdate</h2>
+      <p class="backdate-preview" id="backdate-preview" hidden></p>
+      <label class="backdate-label" for="backdate-datetime">
+        Date and time
+        <input
+          class="backdate-datetime"
+          type="datetime-local"
+          id="backdate-datetime"
+        />
+      </label>
+      <div class="backdate-actions">
+        <button type="button" class="backdate-btn" id="backdate-cancel">
+          Cancel
+        </button>
+        <button type="button" class="backdate-btn backdate-btn-primary" id="backdate-confirm">
+          Confirm
+        </button>
+      </div>
+    </div>
+  </div>
   <script src="script.js"></script>
 </body>
 </html>
