@@ -8,30 +8,97 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <main class="app">
-    <div class="feed" id="feed" aria-live="polite"></div>
-    <form class="composer" id="composer">
-      <div class="composer-inner">
-        <textarea
-          class="composer-input"
-          id="entry-input"
-          rows="1"
-          placeholder="Write something…"
-          aria-label="Journal entry"
-        ></textarea>
-        <button type="button" class="composer-action" id="paste-btn" aria-label="Paste and submit">
-          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
-            <path fill="currentColor" d="M16 4h-1.18A3 3 0 0 0 12 2a3 3 0 0 0-2.82 2H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2zm-4-1a1 1 0 0 1 1 1h-2a1 1 0 0 1 1-1zm4 17H8V6h2v1a1 1 0 0 0 1 1h2a1 1 0 0 0 1-1V6h2v14z" />
-          </svg>
-        </button>
-        <button type="submit" class="composer-action" aria-label="Send entry">
-          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
-            <path fill="currentColor" d="M12 4l-7 7h4.5v9h5v-9H19z" />
-          </svg>
+  <div class="settings-wrap" id="settings-wrap">
+    <button
+      type="button"
+      class="settings-open"
+      id="settings-open"
+      aria-label="Open settings"
+      aria-haspopup="menu"
+      aria-expanded="false"
+      aria-controls="settings-menu"
+    >
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+        <path
+          fill="currentColor"
+          d="M19.14 12.94c.04-.31.06-.63.06-.94s-.02-.63-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.07 7.07 0 0 0-1.63-.94l-.36-2.54A.5.5 0 0 0 13.9 2h-3.8a.5.5 0 0 0-.49.42l-.36 2.54c-.6.24-1.15.55-1.63.94l-2.39-.96a.5.5 0 0 0-.6.22L2.71 8.48a.5.5 0 0 0 .12.64l2.03 1.58c-.04.31-.06.63-.06.94s.02.63.06.94L2.83 14.5a.5.5 0 0 0-.12.64l1.92 3.32c.14.24.43.34.68.22l2.39-.96c.48.39 1.03.7 1.63.94l.36 2.54c.05.24.25.42.49.42h3.8c.24 0 .44-.18.49-.42l.36-2.54c.6-.24 1.15-.55 1.63-.94l2.39.96c.25.12.54.02.68-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58zM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"
+        />
+      </svg>
+    </button>
+    <div class="settings-menu" id="settings-menu" role="menu" hidden>
+      <button
+        type="button"
+        class="settings-menu-item"
+        role="menuitemradio"
+        data-view-mode="timeline"
+        aria-checked="false"
+      >
+        <span class="settings-menu-label">Timeline <kbd class="settings-kbd">T</kbd></span>
+        <span class="settings-menu-desc">Scroll all days in one feed</span>
+      </button>
+      <button
+        type="button"
+        class="settings-menu-item"
+        role="menuitemradio"
+        data-view-mode="day"
+        aria-checked="false"
+      >
+        <span class="settings-menu-label">Day <kbd class="settings-kbd">D</kbd></span>
+        <span class="settings-menu-desc">Pick a day from the sidebar</span>
+      </button>
+    </div>
+  </div>
+
+  <main class="app" id="app">
+    <aside class="sidebar" id="sidebar" aria-label="Navigation"></aside>
+    <div class="main-column">
+      <nav class="journal-tabs" id="journal-tabs" aria-label="Journals" hidden></nav>
+      <div class="feed" id="feed" aria-live="polite"></div>
+      <form class="composer" id="composer">
+        <div class="composer-inner">
+          <textarea
+            class="composer-input"
+            id="entry-input"
+            rows="1"
+            placeholder="Write something…"
+            aria-label="Journal entry"
+          ></textarea>
+          <button type="button" class="composer-action" id="paste-btn" aria-label="Paste and submit">
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+              <path fill="currentColor" d="M16 4h-1.18A3 3 0 0 0 12 2a3 3 0 0 0-2.82 2H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2zm-4-1a1 1 0 0 1 1 1h-2a1 1 0 0 1 1-1zm4 17H8V6h2v1a1 1 0 0 0 1 1h2a1 1 0 0 0 1-1V6h2v14z" />
+            </svg>
+          </button>
+          <button type="submit" class="composer-action" aria-label="Send entry">
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+              <path fill="currentColor" d="M12 4l-7 7h4.5v9h5v-9H19z" />
+            </svg>
+          </button>
+        </div>
+      </form>
+    </div>
+  </main>
+
+  <div class="name-sheet" id="name-sheet" hidden>
+    <div
+      class="name-panel"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="name-title"
+    >
+      <h2 class="name-title" id="name-title">Journal</h2>
+      <label class="name-label" for="name-input">
+        Name
+        <input class="name-input" type="text" id="name-input" maxlength="80" />
+      </label>
+      <div class="name-actions">
+        <button type="button" class="backdate-btn" id="name-cancel">Cancel</button>
+        <button type="button" class="backdate-btn backdate-btn-primary" id="name-confirm">
+          Save
         </button>
       </div>
-    </form>
-  </main>
+    </div>
+  </div>
+
   <div class="backdate-sheet" id="backdate-sheet" hidden>
     <div
       class="backdate-panel"
@@ -59,6 +126,8 @@
       </div>
     </div>
   </div>
+
+  <div class="context-menu" id="context-menu" role="menu" hidden></div>
   <script src="script.js"></script>
 </body>
 </html>
