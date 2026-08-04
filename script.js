@@ -3,6 +3,29 @@ const SETTINGS_KEY = 'journal-mvp:settings'
 const VIEW_MODE_DAY = 'day'
 const VIEW_MODE_TIMELINE = 'timeline'
 const DEFAULT_JOURNAL_ID = 'journal-default'
+const PERSIST_DEBOUNCE_MS = 400
+
+const supabase = window.supabase.createClient(
+  window.JOURNAL_SUPABASE.url,
+  window.JOURNAL_SUPABASE.anonKey,
+  {
+    // No auth in this MVP — skip session storage so Tracking Prevention
+    // (Safari/Edge) can't block the client when the library is third-party.
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+      storage: {
+        getItem: () => null,
+        setItem: () => {},
+        removeItem: () => {},
+      },
+    },
+  },
+)
+
+let journalPersistTimer = null
+let journalPersistChain = Promise.resolve()
 
 const appEl = document.getElementById('app')
 const sidebarEl = document.getElementById('sidebar')
@@ -31,8 +54,8 @@ const backdateCancelEl = document.getElementById('backdate-cancel')
 const backdateConfirmEl = document.getElementById('backdate-confirm')
 const contextMenuEl = document.getElementById('context-menu')
 
-let settings = loadSettings()
-let entries = loadEntries()
+let settings = normalizeSettings(null)
+let entries = []
 let selectedDayKey = null
 let editingId = null
 /** @type {{ text: string, sourceId: string, createdAt?: string } | null} */
@@ -52,12 +75,7 @@ let historyExpandedIndex = null
 /** Avoid re-touching the same journal on every composer keystroke. */
 let lastMarkedUsedJournalId = null
 /** @type {Set<string>} */
-const collapsedFolderIds = new Set(settings.collapsedFolderIds ?? [])
-
-// Persist migrated journalIds / default journal settings once.
-seedJournalLastUsedFromEntries()
-saveSettings()
-saveEntries()
+const collapsedFolderIds = new Set()
 
 function createDefaultJournal() {
   return {
@@ -195,7 +213,7 @@ function normalizeEntry(entry, fallbackJournalId) {
   return normalized
 }
 
-function loadEntries() {
+function loadEntriesFromLocal() {
   const fallbackJournalId = settings.journals[0]?.id ?? DEFAULT_JOURNAL_ID
 
   try {
@@ -211,8 +229,274 @@ function loadEntries() {
   }
 }
 
+function writeEntriesLocal(nextEntries = entries) {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(nextEntries))
+}
+
+function folderRowFromState(folder) {
+  return {
+    id: folder.id,
+    name: folder.name,
+    parent_id: folder.parentId || null,
+  }
+}
+
+function folderFromRow(row) {
+  return normalizeFolder({
+    id: row.id,
+    name: row.name,
+    parentId: row.parent_id,
+  })
+}
+
+function journalRowFromState(journal) {
+  return {
+    id: journal.id,
+    name: journal.name,
+    parent_id: journal.parentId || null,
+    last_used_at: journal.lastUsedAt || null,
+  }
+}
+
+function journalFromRow(row) {
+  return normalizeJournal({
+    id: row.id,
+    name: row.name,
+    parentId: row.parent_id,
+    lastUsedAt: row.last_used_at,
+  })
+}
+
+function entryRowFromState(entry) {
+  return {
+    id: entry.id,
+    journal_id: entry.journalId,
+    text: entry.text,
+    created_at: entry.createdAt,
+    quote: entry.quote || null,
+    history: Array.isArray(entry.history) ? entry.history : [],
+    updated_at: new Date().toISOString(),
+  }
+}
+
+function entryFromRow(row, fallbackJournalId) {
+  return normalizeEntry(
+    {
+      id: row.id,
+      text: row.text,
+      createdAt: row.created_at,
+      journalId: row.journal_id,
+      quote: row.quote || undefined,
+      history: row.history || undefined,
+    },
+    fallbackJournalId,
+  )
+}
+
+/** Parents before children so self-FK upserts succeed. */
+function sortFoldersForUpsert(folders) {
+  const byId = new Map(folders.map((folder) => [folder.id, folder]))
+  const sorted = []
+  const visiting = new Set()
+  const visited = new Set()
+
+  function visit(id) {
+    if (visited.has(id) || !byId.has(id)) return
+    if (visiting.has(id)) return
+    visiting.add(id)
+    const folder = byId.get(id)
+    if (folder.parentId) visit(folder.parentId)
+    visiting.delete(id)
+    visited.add(id)
+    sorted.push(folder)
+  }
+
+  for (const folder of folders) visit(folder.id)
+  return sorted
+}
+
+function isDefaultRemoteSeed(folders, journals, settingsRow, entryCount) {
+  if (entryCount > 0) return false
+  if (folders.length > 0) return false
+  if (journals.length !== 1) return false
+  const only = journals[0]
+  if (!only || only.id !== DEFAULT_JOURNAL_ID || only.name !== 'Journal') return false
+  if (only.parentId) return false
+  if (!settingsRow) return true
+  if (settingsRow.view_mode !== VIEW_MODE_TIMELINE) return false
+  if (settingsRow.selected_journal_id !== DEFAULT_JOURNAL_ID) return false
+  const collapsed = settingsRow.collapsed_folder_ids
+  if (Array.isArray(collapsed) && collapsed.length > 0) return false
+  return true
+}
+
+async function loadJournalStateFromSupabase() {
+  const [
+    { data: folderRows, error: foldersError },
+    { data: journalRows, error: journalsError },
+    { data: settingsRow, error: settingsError },
+    { data: entryRows, error: entriesError },
+  ] = await Promise.all([
+    supabase.from('folders').select('*'),
+    supabase.from('journals').select('*'),
+    supabase.from('journal_settings').select('*').eq('id', 1).maybeSingle(),
+    supabase.from('entries').select('*').order('created_at', { ascending: true }),
+  ])
+
+  if (foldersError) throw foldersError
+  if (journalsError) throw journalsError
+  if (settingsError) throw settingsError
+  if (entriesError) throw entriesError
+
+  const folders = (folderRows || []).map(folderFromRow).filter(Boolean)
+  const journals = (journalRows || []).map(journalFromRow).filter(Boolean)
+  const fallbackJournalId = journals[0]?.id ?? DEFAULT_JOURNAL_ID
+  const nextEntries = (entryRows || [])
+    .map((row) => entryFromRow(row, fallbackJournalId))
+    .filter(Boolean)
+
+  if (isDefaultRemoteSeed(folders, journals, settingsRow, nextEntries.length)) {
+    return null
+  }
+
+  const nextSettings = normalizeSettings({
+    viewMode: settingsRow?.view_mode,
+    folders,
+    journals,
+    selectedJournalId: settingsRow?.selected_journal_id,
+    collapsedFolderIds: settingsRow?.collapsed_folder_ids,
+  })
+
+  return { settings: nextSettings, entries: nextEntries }
+}
+
+async function loadJournalState() {
+  try {
+    const remote = await loadJournalStateFromSupabase()
+    if (remote) {
+      writeSettingsLocal(remote.settings)
+      writeEntriesLocal(remote.entries)
+      return remote
+    }
+  } catch (err) {
+    console.error('Failed to load journal from Supabase:', err)
+  }
+
+  const localSettings = loadSettingsFromLocal()
+  // Temporary assign so loadEntriesFromLocal can read journal ids.
+  settings = localSettings
+  return {
+    settings: localSettings,
+    entries: loadEntriesFromLocal(),
+  }
+}
+
+async function persistEntriesToSupabase(nextEntries = entries) {
+  const desiredIds = new Set(nextEntries.map((entry) => entry.id))
+  const { data: existing, error: existingError } = await supabase
+    .from('entries')
+    .select('id')
+  if (existingError) throw existingError
+
+  const toDelete = (existing || [])
+    .map((row) => row.id)
+    .filter((id) => !desiredIds.has(id))
+  if (toDelete.length > 0) {
+    const { error: deleteError } = await supabase
+      .from('entries')
+      .delete()
+      .in('id', toDelete)
+    if (deleteError) throw deleteError
+  }
+
+  if (nextEntries.length === 0) return
+
+  const { error: upsertError } = await supabase
+    .from('entries')
+    .upsert(nextEntries.map(entryRowFromState))
+  if (upsertError) throw upsertError
+}
+
+async function persistSettingsToSupabase(nextSettings = settings) {
+  const folders = sortFoldersForUpsert(nextSettings.folders)
+  const journals = nextSettings.journals
+  const folderIds = new Set(folders.map((folder) => folder.id))
+  const journalIds = new Set(journals.map((journal) => journal.id))
+
+  const [{ data: existingFolders, error: existingFoldersError }, { data: existingJournals, error: existingJournalsError }] =
+    await Promise.all([
+      supabase.from('folders').select('id'),
+      supabase.from('journals').select('id'),
+    ])
+  if (existingFoldersError) throw existingFoldersError
+  if (existingJournalsError) throw existingJournalsError
+
+  if (folders.length > 0) {
+    const { error: upsertFoldersError } = await supabase
+      .from('folders')
+      .upsert(folders.map(folderRowFromState))
+    if (upsertFoldersError) throw upsertFoldersError
+  }
+
+  if (journals.length > 0) {
+    const { error: upsertJournalsError } = await supabase
+      .from('journals')
+      .upsert(journals.map(journalRowFromState))
+    if (upsertJournalsError) throw upsertJournalsError
+  }
+
+  const { error: settingsError } = await supabase.from('journal_settings').upsert({
+    id: 1,
+    view_mode: nextSettings.viewMode,
+    selected_journal_id: nextSettings.selectedJournalId,
+    collapsed_folder_ids: nextSettings.collapsedFolderIds || [],
+    updated_at: new Date().toISOString(),
+  })
+  if (settingsError) throw settingsError
+
+  const journalsToDelete = (existingJournals || [])
+    .map((row) => row.id)
+    .filter((id) => !journalIds.has(id))
+  if (journalsToDelete.length > 0) {
+    const { error: deleteJournalsError } = await supabase
+      .from('journals')
+      .delete()
+      .in('id', journalsToDelete)
+    if (deleteJournalsError) throw deleteJournalsError
+  }
+
+  const foldersToDelete = (existingFolders || [])
+    .map((row) => row.id)
+    .filter((id) => !folderIds.has(id))
+  if (foldersToDelete.length > 0) {
+    const { error: deleteFoldersError } = await supabase
+      .from('folders')
+      .delete()
+      .in('id', foldersToDelete)
+    if (deleteFoldersError) throw deleteFoldersError
+  }
+}
+
+function queueJournalPersist() {
+  writeSettingsLocal()
+  writeEntriesLocal()
+  if (journalPersistTimer) clearTimeout(journalPersistTimer)
+  journalPersistTimer = setTimeout(() => {
+    journalPersistTimer = null
+    const settingsSnapshot = structuredClone(settings)
+    const entriesSnapshot = structuredClone(entries)
+    journalPersistChain = journalPersistChain
+      .then(async () => {
+        // Folders/journals first so entry FKs stay valid.
+        await persistSettingsToSupabase(settingsSnapshot)
+        await persistEntriesToSupabase(entriesSnapshot)
+      })
+      .catch((err) => console.error('Failed to save journal to Supabase:', err))
+  }, PERSIST_DEBOUNCE_MS)
+}
+
 function saveEntries() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(entries))
+  queueJournalPersist()
 }
 
 function normalizeSettings(value) {
@@ -272,7 +556,7 @@ function normalizeSettings(value) {
   }
 }
 
-function loadSettings() {
+function loadSettingsFromLocal() {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY)
     if (!raw) return normalizeSettings(null)
@@ -282,9 +566,136 @@ function loadSettings() {
   }
 }
 
-function saveSettings() {
-  localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings))
+function writeSettingsLocal(nextSettings = settings) {
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(nextSettings))
 }
+
+function saveSettings() {
+  queueJournalPersist()
+}
+
+function localHasJournalData() {
+  const localSettings = loadSettingsFromLocal()
+  const previousSettings = settings
+  settings = localSettings
+  const localEntries = loadEntriesFromLocal()
+  settings = previousSettings
+
+  const hasExtraJournals =
+    localSettings.journals.length > 1 ||
+    localSettings.journals.some(
+      (journal) =>
+        journal.id !== DEFAULT_JOURNAL_ID || journal.name !== 'Journal' || journal.parentId,
+    )
+  const hasFolders = localSettings.folders.length > 0
+  const hasCustomSettings =
+    localSettings.viewMode !== VIEW_MODE_TIMELINE ||
+    localSettings.selectedJournalId !== DEFAULT_JOURNAL_ID ||
+    localSettings.collapsedFolderIds.length > 0
+
+  return localEntries.length > 0 || hasExtraJournals || hasFolders || hasCustomSettings
+}
+
+async function remoteHasJournalData() {
+  const [
+    { count: entryCount, error: entryError },
+    { count: folderCount, error: folderError },
+    { count: journalCount, error: journalError },
+  ] = await Promise.all([
+    supabase.from('entries').select('id', { count: 'exact', head: true }),
+    supabase.from('folders').select('id', { count: 'exact', head: true }),
+    supabase.from('journals').select('id', { count: 'exact', head: true }),
+  ])
+  if (entryError) throw entryError
+  if (folderError) throw folderError
+  if (journalError) throw journalError
+
+  if ((entryCount || 0) > 0) return true
+  if ((folderCount || 0) > 0) return true
+  if ((journalCount || 0) > 1) return true
+
+  const { data: settingsRow, error: settingsError } = await supabase
+    .from('journal_settings')
+    .select('view_mode, selected_journal_id, collapsed_folder_ids')
+    .eq('id', 1)
+    .maybeSingle()
+  if (settingsError) throw settingsError
+
+  const { data: journals, error: journalsError } = await supabase
+    .from('journals')
+    .select('id, name, parent_id')
+  if (journalsError) throw journalsError
+
+  const mapped = (journals || []).map(journalFromRow).filter(Boolean)
+  return !isDefaultRemoteSeed([], mapped, settingsRow, 0)
+}
+
+async function migrateFromLocalStorageIfNeeded() {
+  if (!localHasJournalData()) return
+  if (await remoteHasJournalData()) return
+
+  console.info('Migrating journal localStorage → Supabase…')
+  const localSettings = loadSettingsFromLocal()
+  settings = localSettings
+  const localEntries = loadEntriesFromLocal()
+  await persistSettingsToSupabase(localSettings)
+  await persistEntriesToSupabase(localEntries)
+  console.info('Migration complete.')
+}
+
+async function flushAllPendingPersists() {
+  if (journalPersistTimer) {
+    clearTimeout(journalPersistTimer)
+    journalPersistTimer = null
+    const settingsSnapshot = structuredClone(settings)
+    const entriesSnapshot = structuredClone(entries)
+    journalPersistChain = journalPersistChain
+      .then(async () => {
+        await persistSettingsToSupabase(settingsSnapshot)
+        await persistEntriesToSupabase(entriesSnapshot)
+      })
+      .catch((err) => console.error('Failed to save journal to Supabase:', err))
+  }
+  await journalPersistChain
+}
+
+function syncCollapsedFolderIdsFromSettings() {
+  collapsedFolderIds.clear()
+  for (const id of settings.collapsedFolderIds ?? []) {
+    collapsedFolderIds.add(id)
+  }
+}
+
+async function boot() {
+  try {
+    await migrateFromLocalStorageIfNeeded()
+  } catch (err) {
+    console.error('Migration failed:', err)
+  }
+
+  const loaded = await loadJournalState()
+  settings = loaded.settings
+  entries = loaded.entries
+  syncCollapsedFolderIdsFromSettings()
+
+  if (seedJournalLastUsedFromEntries()) {
+    saveSettings()
+  }
+
+  render()
+  resetComposerHeight()
+  inputEl.focus()
+}
+
+window.addEventListener('beforeunload', () => {
+  void flushAllPendingPersists()
+})
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') {
+    void flushAllPendingPersists()
+  }
+})
 
 function createEntry(text, createdAt = new Date().toISOString(), quote = null) {
   const entry = {
@@ -2265,6 +2676,4 @@ composerQuoteDismissEl.addEventListener('click', () => {
   inputEl.focus()
 })
 
-render()
-resetComposerHeight()
-inputEl.focus()
+boot()
