@@ -337,10 +337,10 @@ async function loadJournalStateFromSupabase() {
     { data: settingsRow, error: settingsError },
     { data: entryRows, error: entriesError },
   ] = await Promise.all([
-    supabase.from('folders').select('*'),
-    supabase.from('journals').select('*'),
+    supabase.from('journal_folders').select('*'),
+    supabase.from('journal_journals').select('*'),
     supabase.from('journal_settings').select('*').eq('id', 1).maybeSingle(),
-    supabase.from('entries').select('*').order('created_at', { ascending: true }),
+    supabase.from('journal_entries').select('*').order('created_at', { ascending: true }),
   ])
 
   if (foldersError) throw foldersError
@@ -394,7 +394,7 @@ async function loadJournalState() {
 async function persistEntriesToSupabase(nextEntries = entries) {
   const desiredIds = new Set(nextEntries.map((entry) => entry.id))
   const { data: existing, error: existingError } = await supabase
-    .from('entries')
+    .from('journal_entries')
     .select('id')
   if (existingError) throw existingError
 
@@ -403,7 +403,7 @@ async function persistEntriesToSupabase(nextEntries = entries) {
     .filter((id) => !desiredIds.has(id))
   if (toDelete.length > 0) {
     const { error: deleteError } = await supabase
-      .from('entries')
+      .from('journal_entries')
       .delete()
       .in('id', toDelete)
     if (deleteError) throw deleteError
@@ -412,7 +412,7 @@ async function persistEntriesToSupabase(nextEntries = entries) {
   if (nextEntries.length === 0) return
 
   const { error: upsertError } = await supabase
-    .from('entries')
+    .from('journal_entries')
     .upsert(nextEntries.map(entryRowFromState))
   if (upsertError) throw upsertError
 }
@@ -425,22 +425,22 @@ async function persistSettingsToSupabase(nextSettings = settings) {
 
   const [{ data: existingFolders, error: existingFoldersError }, { data: existingJournals, error: existingJournalsError }] =
     await Promise.all([
-      supabase.from('folders').select('id'),
-      supabase.from('journals').select('id'),
+      supabase.from('journal_folders').select('id'),
+      supabase.from('journal_journals').select('id'),
     ])
   if (existingFoldersError) throw existingFoldersError
   if (existingJournalsError) throw existingJournalsError
 
   if (folders.length > 0) {
     const { error: upsertFoldersError } = await supabase
-      .from('folders')
+      .from('journal_folders')
       .upsert(folders.map(folderRowFromState))
     if (upsertFoldersError) throw upsertFoldersError
   }
 
   if (journals.length > 0) {
     const { error: upsertJournalsError } = await supabase
-      .from('journals')
+      .from('journal_journals')
       .upsert(journals.map(journalRowFromState))
     if (upsertJournalsError) throw upsertJournalsError
   }
@@ -459,7 +459,7 @@ async function persistSettingsToSupabase(nextSettings = settings) {
     .filter((id) => !journalIds.has(id))
   if (journalsToDelete.length > 0) {
     const { error: deleteJournalsError } = await supabase
-      .from('journals')
+      .from('journal_journals')
       .delete()
       .in('id', journalsToDelete)
     if (deleteJournalsError) throw deleteJournalsError
@@ -470,7 +470,7 @@ async function persistSettingsToSupabase(nextSettings = settings) {
     .filter((id) => !folderIds.has(id))
   if (foldersToDelete.length > 0) {
     const { error: deleteFoldersError } = await supabase
-      .from('folders')
+      .from('journal_folders')
       .delete()
       .in('id', foldersToDelete)
     if (deleteFoldersError) throw deleteFoldersError
@@ -602,9 +602,9 @@ async function remoteHasJournalData() {
     { count: folderCount, error: folderError },
     { count: journalCount, error: journalError },
   ] = await Promise.all([
-    supabase.from('entries').select('id', { count: 'exact', head: true }),
-    supabase.from('folders').select('id', { count: 'exact', head: true }),
-    supabase.from('journals').select('id', { count: 'exact', head: true }),
+    supabase.from('journal_entries').select('id', { count: 'exact', head: true }),
+    supabase.from('journal_folders').select('id', { count: 'exact', head: true }),
+    supabase.from('journal_journals').select('id', { count: 'exact', head: true }),
   ])
   if (entryError) throw entryError
   if (folderError) throw folderError
@@ -622,7 +622,7 @@ async function remoteHasJournalData() {
   if (settingsError) throw settingsError
 
   const { data: journals, error: journalsError } = await supabase
-    .from('journals')
+    .from('journal_journals')
     .select('id, name, parent_id')
   if (journalsError) throw journalsError
 
