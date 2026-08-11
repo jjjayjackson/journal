@@ -1,4 +1,6 @@
 const STORAGE_KEY = 'journal-mvp:entries'
+const ENTRY_KIND_ENTRY = 'entry'
+const ENTRY_KIND_ANNOUNCEMENT = 'announcement'
 const SETTINGS_KEY = 'journal-mvp:settings'
 const VIEW_MODE_DAY = 'day'
 const VIEW_MODE_TIMELINE = 'timeline'
@@ -29,6 +31,7 @@ let journalPersistChain = Promise.resolve()
 
 const appEl = document.getElementById('app')
 const sidebarEl = document.getElementById('sidebar')
+const journalViewEl = document.getElementById('journal-view')
 const journalTabsEl = document.getElementById('journal-tabs')
 const feedEl = document.getElementById('feed')
 const composerEl = document.getElementById('composer')
@@ -36,11 +39,15 @@ const inputEl = document.getElementById('entry-input')
 const pasteBtnEl = document.getElementById('paste-btn')
 const composerQuoteEl = document.getElementById('composer-quote')
 const composerQuoteMetaEl = document.getElementById('composer-quote-meta')
+const composerQuoteClampEl = document.getElementById('composer-quote-clamp')
 const composerQuoteTextEl = document.getElementById('composer-quote-text')
+const composerQuoteToggleEl = document.getElementById('composer-quote-toggle')
 const composerQuoteDismissEl = document.getElementById('composer-quote-dismiss')
-const settingsWrapEl = document.getElementById('settings-wrap')
 const settingsOpenEl = document.getElementById('settings-open')
-const settingsMenuEl = document.getElementById('settings-menu')
+const settingsCloseEl = document.getElementById('settings-close')
+const settingsViewEl = document.getElementById('settings-view')
+const viewModeSegmentEl = document.getElementById('view-mode-segment')
+const showWeekdayEl = document.getElementById('show-weekday')
 const nameSheetEl = document.getElementById('name-sheet')
 const nameTitleEl = document.getElementById('name-title')
 const nameInputEl = document.getElementById('name-input')
@@ -64,6 +71,8 @@ let bHeld = false
 let hHeld = false
 let backdateSession = null
 let nameSession = null
+/** @type {'journal' | 'settings'} */
+let currentView = 'journal'
 /** @type {'journal' | 'entry' | null} */
 let contextMenuKind = null
 let contextMenuJournalId = null
@@ -72,6 +81,11 @@ let contextMenuEntryId = null
 let historyEntryId = null
 /** Expanded history row index within the open panel, or null. */
 let historyExpandedIndex = null
+/** Entry ids whose quoted text is fully expanded. */
+/** @type {Set<string>} */
+const expandedQuoteIds = new Set()
+/** Whether the composer quote preview is fully expanded. */
+let composerQuoteExpanded = false
 /** Avoid re-touching the same journal on every composer keystroke. */
 let lastMarkedUsedJournalId = null
 /** @type {Set<string>} */
@@ -148,6 +162,54 @@ function normalizeQuote(quote) {
   return normalized
 }
 
+function normalizeCopiedFrom(copiedFrom) {
+  if (!copiedFrom || typeof copiedFrom !== 'object') return null
+  if (typeof copiedFrom.sourceId !== 'string' || !copiedFrom.sourceId) {
+    return null
+  }
+
+  const normalized = { sourceId: copiedFrom.sourceId }
+
+  if (typeof copiedFrom.createdAt === 'string') {
+    const date = new Date(copiedFrom.createdAt)
+    if (!Number.isNaN(date.getTime())) {
+      normalized.createdAt = copiedFrom.createdAt
+    }
+  }
+
+  return normalized
+}
+
+function normalizeMovedFrom(movedFrom) {
+  if (!movedFrom || typeof movedFrom !== 'object') return null
+
+  const journalName =
+    typeof movedFrom.journalName === 'string' ? movedFrom.journalName.trim() : ''
+  if (!journalName) return null
+
+  const normalized = { journalName }
+
+  if (typeof movedFrom.journalId === 'string' && movedFrom.journalId) {
+    normalized.journalId = movedFrom.journalId
+  }
+
+  if (typeof movedFrom.movedAt === 'string') {
+    const movedAt = new Date(movedFrom.movedAt)
+    if (!Number.isNaN(movedAt.getTime())) {
+      normalized.movedAt = movedFrom.movedAt
+    }
+  }
+
+  if (typeof movedFrom.createdAt === 'string') {
+    const createdAt = new Date(movedFrom.createdAt)
+    if (!Number.isNaN(createdAt.getTime())) {
+      normalized.createdAt = movedFrom.createdAt
+    }
+  }
+
+  return normalized
+}
+
 function normalizeHistoryItem(item) {
   if (!item || typeof item !== 'object') return null
   if (typeof item.text !== 'string' || typeof item.editedAt !== 'string') return null
@@ -202,8 +264,18 @@ function normalizeEntry(entry, fallbackJournalId) {
     journalId,
   }
 
+  if (entry.kind === ENTRY_KIND_ANNOUNCEMENT) {
+    normalized.kind = ENTRY_KIND_ANNOUNCEMENT
+  }
+
   const quote = normalizeQuote(entry.quote)
   if (quote) normalized.quote = quote
+
+  const copiedFrom = normalizeCopiedFrom(entry.copiedFrom)
+  if (copiedFrom) normalized.copiedFrom = copiedFrom
+
+  const movedFrom = normalizeMovedFrom(entry.movedFrom)
+  if (movedFrom) normalized.movedFrom = movedFrom
 
   if (Array.isArray(entry.history)) {
     const history = entry.history.map(normalizeHistoryItem).filter(Boolean)
@@ -273,7 +345,13 @@ function entryRowFromState(entry) {
     journal_id: entry.journalId,
     text: entry.text,
     created_at: entry.createdAt,
+    kind:
+      entry.kind === ENTRY_KIND_ANNOUNCEMENT
+        ? ENTRY_KIND_ANNOUNCEMENT
+        : ENTRY_KIND_ENTRY,
     quote: entry.quote || null,
+    copied_from: entry.copiedFrom || null,
+    moved_from: entry.movedFrom || null,
     history: Array.isArray(entry.history) ? entry.history : [],
     updated_at: new Date().toISOString(),
   }
@@ -286,7 +364,10 @@ function entryFromRow(row, fallbackJournalId) {
       text: row.text,
       createdAt: row.created_at,
       journalId: row.journal_id,
+      kind: row.kind || undefined,
       quote: row.quote || undefined,
+      copiedFrom: row.copied_from || undefined,
+      movedFrom: row.moved_from || undefined,
       history: row.history || undefined,
     },
     fallbackJournalId,
@@ -325,6 +406,7 @@ function isDefaultRemoteSeed(folders, journals, settingsRow, entryCount) {
   if (!settingsRow) return true
   if (settingsRow.view_mode !== VIEW_MODE_TIMELINE) return false
   if (settingsRow.selected_journal_id !== DEFAULT_JOURNAL_ID) return false
+  if (settingsRow.show_weekday === true) return false
   const collapsed = settingsRow.collapsed_folder_ids
   if (Array.isArray(collapsed) && collapsed.length > 0) return false
   return true
@@ -359,8 +441,13 @@ async function loadJournalStateFromSupabase() {
     return null
   }
 
+  const localSettings = loadSettingsFromLocal()
   const nextSettings = normalizeSettings({
     viewMode: settingsRow?.view_mode,
+    showWeekday:
+      typeof settingsRow?.show_weekday === 'boolean'
+        ? settingsRow.show_weekday
+        : localSettings.showWeekday,
     folders,
     journals,
     selectedJournalId: settingsRow?.selected_journal_id,
@@ -445,13 +532,23 @@ async function persistSettingsToSupabase(nextSettings = settings) {
     if (upsertJournalsError) throw upsertJournalsError
   }
 
-  const { error: settingsError } = await supabase.from('journal_settings').upsert({
+  const settingsPayload = {
     id: 1,
     view_mode: nextSettings.viewMode,
+    show_weekday: !!nextSettings.showWeekday,
     selected_journal_id: nextSettings.selectedJournalId,
     collapsed_folder_ids: nextSettings.collapsedFolderIds || [],
     updated_at: new Date().toISOString(),
-  })
+  }
+  let { error: settingsError } = await supabase
+    .from('journal_settings')
+    .upsert(settingsPayload)
+  if (settingsError && /show_weekday/i.test(settingsError.message || '')) {
+    const { show_weekday, ...withoutWeekday } = settingsPayload
+    ;({ error: settingsError } = await supabase
+      .from('journal_settings')
+      .upsert(withoutWeekday))
+  }
   if (settingsError) throw settingsError
 
   const journalsToDelete = (existingJournals || [])
@@ -502,6 +599,7 @@ function saveEntries() {
 function normalizeSettings(value) {
   const mode =
     value?.viewMode === VIEW_MODE_DAY ? VIEW_MODE_DAY : VIEW_MODE_TIMELINE
+  const showWeekday = value?.showWeekday === true
 
   let folders = Array.isArray(value?.folders)
     ? value.folders.map(normalizeFolder).filter(Boolean)
@@ -549,6 +647,7 @@ function normalizeSettings(value) {
 
   return {
     viewMode: mode,
+    showWeekday,
     folders,
     journals,
     selectedJournalId,
@@ -590,6 +689,7 @@ function localHasJournalData() {
   const hasFolders = localSettings.folders.length > 0
   const hasCustomSettings =
     localSettings.viewMode !== VIEW_MODE_TIMELINE ||
+    localSettings.showWeekday ||
     localSettings.selectedJournalId !== DEFAULT_JOURNAL_ID ||
     localSettings.collapsedFolderIds.length > 0
 
@@ -616,10 +716,27 @@ async function remoteHasJournalData() {
 
   const { data: settingsRow, error: settingsError } = await supabase
     .from('journal_settings')
-    .select('view_mode, selected_journal_id, collapsed_folder_ids')
+    .select('view_mode, selected_journal_id, collapsed_folder_ids, show_weekday')
     .eq('id', 1)
     .maybeSingle()
-  if (settingsError) throw settingsError
+  if (settingsError) {
+    // Older DBs may not have show_weekday yet.
+    if (/show_weekday/i.test(settingsError.message || '')) {
+      const { data: fallbackRow, error: fallbackError } = await supabase
+        .from('journal_settings')
+        .select('view_mode, selected_journal_id, collapsed_folder_ids')
+        .eq('id', 1)
+        .maybeSingle()
+      if (fallbackError) throw fallbackError
+      const { data: journals, error: journalsError } = await supabase
+        .from('journal_journals')
+        .select('id, name, parent_id')
+      if (journalsError) throw journalsError
+      const mapped = (journals || []).map(journalFromRow).filter(Boolean)
+      return !isDefaultRemoteSeed([], mapped, fallbackRow, 0)
+    }
+    throw settingsError
+  }
 
   const { data: journals, error: journalsError } = await supabase
     .from('journal_journals')
@@ -707,6 +824,20 @@ function createEntry(text, createdAt = new Date().toISOString(), quote = null) {
   const normalizedQuote = normalizeQuote(quote)
   if (normalizedQuote) entry.quote = normalizedQuote
   return entry
+}
+
+function isAnnouncementEntry(entry) {
+  return entry?.kind === ENTRY_KIND_ANNOUNCEMENT
+}
+
+function createAnnouncementEntry(journalId, text, createdAt = new Date().toISOString()) {
+  return {
+    id: crypto.randomUUID(),
+    text,
+    createdAt,
+    journalId,
+    kind: ENTRY_KIND_ANNOUNCEMENT,
+  }
 }
 
 function getEntryQuoteSnapshot(entry) {
@@ -1001,7 +1132,8 @@ function openJournalContextMenu(journalId, clientX, clientY) {
   const journal = settings.journals.find((item) => item.id === journalId)
   if (!journal) return
 
-  closeSettingsMenu()
+  closeContextMenu()
+  closeSettings()
   contextMenuKind = 'journal'
   contextMenuJournalId = journalId
   contextMenuEntryId = null
@@ -1062,7 +1194,7 @@ function openEntryContextMenu(entryId, clientX, clientY) {
   const entry = entries.find((item) => item.id === entryId)
   if (!entry) return
 
-  closeSettingsMenu()
+  closeSettings()
   contextMenuKind = 'entry'
   contextMenuEntryId = entryId
   contextMenuJournalId = null
@@ -1073,6 +1205,19 @@ function openEntryContextMenu(entryId, clientX, clientY) {
   const entryEl = feedEl.querySelector(`.entry[data-id="${CSS.escape(entryId)}"]`)
   if (entryEl) entryEl.classList.add('is-menu-open')
 
+  if (isAnnouncementEntry(entry)) {
+    contextMenuEl.innerHTML = `
+      <button
+        type="button"
+        class="context-menu-item is-danger"
+        role="menuitem"
+        data-action="delete"
+      >Delete</button>
+    `
+    positionContextMenu(clientX, clientY)
+    return
+  }
+
   contextMenuEl.innerHTML = `
     <button
       type="button"
@@ -1080,6 +1225,18 @@ function openEntryContextMenu(entryId, clientX, clientY) {
       role="menuitem"
       data-action="copy"
     >Copy</button>
+    <button
+      type="button"
+      class="context-menu-item"
+      role="menuitem"
+      data-action="copy-to-menu"
+    >Copy to…</button>
+    <button
+      type="button"
+      class="context-menu-item"
+      role="menuitem"
+      data-action="move-to-menu"
+    >Move to…</button>
     <button
       type="button"
       class="context-menu-item"
@@ -1114,6 +1271,43 @@ function openEntryContextMenu(entryId, clientX, clientY) {
   positionContextMenu(clientX, clientY)
 }
 
+function openTransferToJournalMenu(entryId, mode) {
+  const entry = entries.find((item) => item.id === entryId)
+  if (!entry) return
+
+  const action =
+    mode === 'move' ? 'move-to-journal' : 'copy-to-journal'
+  const label = mode === 'move' ? 'Move to journal' : 'Copy to journal'
+
+  contextMenuKind = 'entry'
+  contextMenuEntryId = entryId
+  contextMenuJournalId = null
+
+  const journals = getJournalsDepthFirst()
+  const journalItems = journals
+    .map((journal) => {
+      const current = journal.id === entry.journalId
+      return `
+        <button
+          type="button"
+          class="context-menu-item${current ? ' is-current' : ''}"
+          role="menuitem"
+          data-action="${action}"
+          data-journal-id="${escapeHtml(journal.id)}"
+          ${current ? 'disabled aria-current="true"' : ''}
+        >${escapeHtml(getJournalPathLabel(journal))}</button>
+      `
+    })
+    .join('')
+
+  const rect = contextMenuEl.getBoundingClientRect()
+  contextMenuEl.innerHTML = `
+    <div class="context-menu-section-label">${label}</div>
+    ${journalItems}
+  `
+  positionContextMenu(rect.left, rect.top)
+}
+
 async function copyEntry(id) {
   const entry = entries.find((item) => item.id === id)
   if (!entry) return
@@ -1125,16 +1319,123 @@ async function copyEntry(id) {
   }
 }
 
-function handleContextMenuAction(action, folderId) {
+function focusEntryInJournal(entryId, journalId, createdAt) {
+  clearPendingQuote()
+  editingId = null
+  historyEntryId = null
+  historyExpandedIndex = null
+  inputEl.value = ''
+  resetComposerHeight()
+
+  expandFolderPathForJournal(journalId)
+  settings.selectedJournalId = journalId
+
+  if (settings.viewMode === VIEW_MODE_DAY) {
+    selectedDayKey = getDayKey(new Date(createdAt))
+  }
+
+  saveSettings()
+  render()
+
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      highlightAndScrollToEntry(entryId)
+    })
+  })
+}
+
+function copyEntryToJournal(entryId, targetJournalId) {
+  const source = entries.find((item) => item.id === entryId)
+  if (!source || isAnnouncementEntry(source)) return
+
+  const targetJournal = settings.journals.find((item) => item.id === targetJournalId)
+  if (!targetJournal) return
+  if (source.journalId === targetJournalId) return
+
+  const copy = {
+    id: crypto.randomUUID(),
+    text: source.text,
+    createdAt: new Date().toISOString(),
+    journalId: targetJournalId,
+    copiedFrom: {
+      sourceId: source.id,
+      createdAt: source.createdAt,
+    },
+  }
+
+  const quote = normalizeQuote(source.quote)
+  if (quote) copy.quote = quote
+
+  entries.push(copy)
+
+  targetJournal.lastUsedAt = new Date().toISOString()
+  lastMarkedUsedJournalId = targetJournalId
+
+  saveEntries()
+  focusEntryInJournal(copy.id, targetJournalId, copy.createdAt)
+}
+
+function moveEntryToJournal(entryId, targetJournalId) {
+  const entry = entries.find((item) => item.id === entryId)
+  if (!entry || isAnnouncementEntry(entry)) return
+
+  const targetJournal = settings.journals.find((item) => item.id === targetJournalId)
+  if (!targetJournal) return
+  if (entry.journalId === targetJournalId) return
+
+  const sourceJournal = settings.journals.find((item) => item.id === entry.journalId)
+  const journalName = sourceJournal
+    ? getJournalPathLabel(sourceJournal)
+    : 'Unknown journal'
+
+  entry.movedFrom = {
+    journalId: entry.journalId,
+    journalName,
+    movedAt: new Date().toISOString(),
+    createdAt: entry.createdAt,
+  }
+  entry.journalId = targetJournalId
+
+  targetJournal.lastUsedAt = new Date().toISOString()
+  lastMarkedUsedJournalId = targetJournalId
+
+  saveEntries()
+  focusEntryInJournal(entry.id, targetJournalId, entry.createdAt)
+}
+
+function handleContextMenuAction(action, folderId, targetJournalId) {
   const kind = contextMenuKind
   const journalId = contextMenuJournalId
   const entryId = contextMenuEntryId
+
+  if (kind === 'entry' && action === 'copy-to-menu') {
+    if (!entryId) {
+      closeContextMenu()
+      return
+    }
+    openTransferToJournalMenu(entryId, 'copy')
+    return
+  }
+
+  if (kind === 'entry' && action === 'move-to-menu') {
+    if (!entryId) {
+      closeContextMenu()
+      return
+    }
+    openTransferToJournalMenu(entryId, 'move')
+    return
+  }
+
   closeContextMenu()
 
   if (kind === 'entry') {
     if (!entryId) return
     if (action === 'copy') {
       copyEntry(entryId)
+    } else if (action === 'copy-to-journal') {
+      if (targetJournalId) copyEntryToJournal(entryId, targetJournalId)
+    } else if (action === 'move-to-journal') {
+      if (targetJournalId) moveEntryToJournal(entryId, targetJournalId)
     } else if (action === 'edit') {
       startEdit(entryId)
     } else if (action === 'build-on') {
@@ -1201,23 +1502,81 @@ function getDayKey(date) {
   return `${year}-${month}-${day}`
 }
 
+function formatWeekday(date) {
+  return [
+    'Sunday',
+    'Monday',
+    'Tuesday',
+    'Wednesday',
+    'Thursday',
+    'Friday',
+    'Saturday',
+  ][date.getDay()]
+}
+
 function formatDayHeader(date) {
   const month = date.getMonth() + 1
   const day = date.getDate()
   const year = String(date.getFullYear()).slice(-2)
-  return `${month}.${day}.${year}`
+  const stamp = `${month}.${day}.${year}`
+  if (!settings.showWeekday) return stamp
+  return `${stamp} • ${formatWeekday(date)}`
 }
 
 function formatEntryTime(date) {
   const hours = String(date.getHours()).padStart(2, '0')
   const minutes = String(date.getMinutes()).padStart(2, '0')
-  return `${hours}${minutes}`
+  const seconds = String(date.getSeconds()).padStart(2, '0')
+  return `${hours}:${minutes}:${seconds}`
 }
 
 function formatQuoteStamp(iso) {
   const date = new Date(iso)
   if (Number.isNaN(date.getTime())) return ''
   return `${formatDayHeader(date)} · ${formatEntryTime(date)}`
+}
+
+/** Announcement banners always skip weekday, even if that setting is on. */
+function formatAnnouncementStamp(iso) {
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return ''
+  const month = date.getMonth() + 1
+  const day = date.getDate()
+  const year = String(date.getFullYear()).slice(-2)
+  return `${month}.${day}.${year} · ${formatEntryTime(date)}`
+}
+
+function formatCopiedFromNote(copiedFrom) {
+  if (!copiedFrom?.createdAt) return 'Entry copied from original'
+  const date = new Date(copiedFrom.createdAt)
+  if (Number.isNaN(date.getTime())) return 'Entry copied from original'
+  return `Entry copied from ${formatDayHeader(date)} at ${formatEntryTime(date)}`
+}
+
+function formatMovedFromNote(movedFrom) {
+  const journalName = movedFrom?.journalName?.trim() || 'Unknown journal'
+  const movedAt = movedFrom?.movedAt ? new Date(movedFrom.movedAt) : null
+  const createdAt = movedFrom?.createdAt ? new Date(movedFrom.createdAt) : null
+
+  const movedStamp =
+    movedAt && !Number.isNaN(movedAt.getTime())
+      ? `${formatDayHeader(movedAt)} at ${formatEntryTime(movedAt)}`
+      : null
+  const createdStamp =
+    createdAt && !Number.isNaN(createdAt.getTime())
+      ? `${formatDayHeader(createdAt)} at ${formatEntryTime(createdAt)}`
+      : null
+
+  if (movedStamp && createdStamp) {
+    return `Moved from ${journalName} on ${movedStamp} · created ${createdStamp}`
+  }
+  if (movedStamp) {
+    return `Moved from ${journalName} on ${movedStamp}`
+  }
+  if (createdStamp) {
+    return `Moved from ${journalName} · created ${createdStamp}`
+  }
+  return `Moved from ${journalName}`
 }
 
 function formatHistoryTime(iso) {
@@ -1401,7 +1760,8 @@ function toDatetimeLocalValue(date) {
   const day = String(date.getDate()).padStart(2, '0')
   const hours = String(date.getHours()).padStart(2, '0')
   const minutes = String(date.getMinutes()).padStart(2, '0')
-  return `${year}-${month}-${day}T${hours}:${minutes}`
+  const seconds = String(date.getSeconds()).padStart(2, '0')
+  return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}`
 }
 
 function fromDatetimeLocalValue(value) {
@@ -1491,9 +1851,18 @@ function shouldArmPasteModifierKey() {
 function updateComposerQuote() {
   if (!pendingQuote) {
     composerQuoteEl.hidden = true
+    composerQuoteEl.classList.remove('is-jumpable', 'is-collapsible', 'is-expanded')
+    composerQuoteEl.removeAttribute('role')
+    composerQuoteEl.removeAttribute('tabindex')
+    composerQuoteEl.removeAttribute('aria-label')
     composerQuoteMetaEl.textContent = ''
     composerQuoteMetaEl.hidden = true
     composerQuoteTextEl.textContent = ''
+    composerQuoteClampEl.classList.remove('is-expanded')
+    composerQuoteToggleEl.hidden = true
+    composerQuoteToggleEl.textContent = 'Show more'
+    composerQuoteToggleEl.setAttribute('aria-expanded', 'false')
+    composerQuoteExpanded = false
     return
   }
 
@@ -1508,18 +1877,64 @@ function updateComposerQuote() {
 
   composerQuoteTextEl.textContent = pendingQuote.text
   composerQuoteEl.hidden = false
+
+  if (pendingQuote.sourceId) {
+    composerQuoteEl.classList.add('is-jumpable')
+    composerQuoteEl.setAttribute('role', 'button')
+    composerQuoteEl.setAttribute('tabindex', '0')
+    composerQuoteEl.setAttribute('aria-label', 'Go to original entry')
+  } else {
+    composerQuoteEl.classList.remove('is-jumpable')
+    composerQuoteEl.removeAttribute('role')
+    composerQuoteEl.removeAttribute('tabindex')
+    composerQuoteEl.removeAttribute('aria-label')
+  }
+
+  enhanceComposerQuoteClamp()
+}
+
+function enhanceComposerQuoteClamp() {
+  composerQuoteEl.classList.remove('is-collapsible', 'is-expanded')
+  composerQuoteClampEl.classList.toggle('is-expanded', composerQuoteExpanded)
+
+  if (composerQuoteExpanded) {
+    composerQuoteEl.classList.add('is-collapsible', 'is-expanded')
+    composerQuoteToggleEl.hidden = false
+    composerQuoteToggleEl.textContent = 'Show less'
+    composerQuoteToggleEl.setAttribute('aria-expanded', 'true')
+    return
+  }
+
+  // Measure overflow while collapsed.
+  composerQuoteClampEl.classList.remove('is-expanded')
+  const overflows =
+    composerQuoteClampEl.scrollHeight > composerQuoteClampEl.clientHeight + 1
+
+  if (overflows) {
+    composerQuoteEl.classList.add('is-collapsible')
+    composerQuoteToggleEl.hidden = false
+    composerQuoteToggleEl.textContent = 'Show more'
+    composerQuoteToggleEl.setAttribute('aria-expanded', 'false')
+  } else {
+    composerQuoteClampEl.classList.add('is-expanded')
+    composerQuoteToggleEl.hidden = true
+    composerQuoteToggleEl.textContent = 'Show more'
+    composerQuoteToggleEl.setAttribute('aria-expanded', 'false')
+  }
 }
 
 function clearPendingQuote() {
   pendingQuote = null
+  composerQuoteExpanded = false
   updateComposerQuote()
 }
 
 function startBuildOn(id) {
   const entry = entries.find((item) => item.id === id)
-  if (!entry) return
+  if (!entry || isAnnouncementEntry(entry)) return
 
   editingId = null
+  composerQuoteExpanded = false
   pendingQuote = {
     text: getEntryQuoteSnapshot(entry),
     sourceId: entry.id,
@@ -1533,7 +1948,7 @@ function startBuildOn(id) {
 
 function startEdit(id) {
   const entry = entries.find((item) => item.id === id)
-  if (!entry) return
+  if (!entry || isAnnouncementEntry(entry)) return
 
   clearPendingQuote()
   editingId = id
@@ -1558,6 +1973,7 @@ function deleteEntry(id) {
     historyEntryId = null
     historyExpandedIndex = null
   }
+  expandedQuoteIds.delete(id)
   saveEntries()
   render()
 }
@@ -1566,7 +1982,7 @@ function openBackdateSheet(session) {
   backdateSession = session
   bHeld = false
   hHeld = false
-  closeSettingsMenu()
+  closeSettings()
 
   backdateTitleEl.textContent =
     session.mode === 'edit' ? 'Edit time' : 'Backdate'
@@ -1629,7 +2045,7 @@ function confirmBackdateSheet() {
 
 function openNameSheet(session) {
   nameSession = session
-  closeSettingsMenu()
+  closeSettings()
   closeContextMenu()
 
   const kind = session.kind === 'folder' ? 'folder' : 'journal'
@@ -1701,18 +2117,44 @@ function confirmNameSheet() {
       folder.name = name
       saveSettings()
     }
-  } else {
-    const journal = settings.journals.find(
-      (item) => item.id === nameSession.journalId,
+    closeNameSheet()
+    render({ preserveScroll: true })
+    return
+  }
+
+  const journal = settings.journals.find(
+    (item) => item.id === nameSession.journalId,
+  )
+  if (!journal) {
+    closeNameSheet()
+    render({ preserveScroll: true })
+    return
+  }
+
+  const previousName = journal.name
+  journal.name = name
+  saveSettings()
+
+  let revealAnnouncement = false
+  if (previousName !== name) {
+    const createdAt = new Date().toISOString()
+    const announcement = createAnnouncementEntry(
+      journal.id,
+      `Journal name changed to “${name}”`,
+      createdAt,
     )
-    if (journal) {
-      journal.name = name
-      saveSettings()
+    entries.push(announcement)
+    markJournalUsed(journal.id)
+    saveEntries()
+    revealAnnouncement =
+      journal.id === settings.selectedJournalId && currentView === 'journal'
+    if (revealAnnouncement && settings.viewMode === VIEW_MODE_DAY) {
+      selectedDayKey = getDayKey(new Date(createdAt))
     }
   }
 
   closeNameSheet()
-  render({ preserveScroll: true })
+  render({ preserveScroll: !revealAnnouncement })
 }
 
 function deleteJournal(journalId) {
@@ -1807,17 +2249,7 @@ function selectJournal(journalId) {
   const journal = settings.journals.find((item) => item.id === journalId)
   if (!journal) return
 
-  let expandedPath = false
-  let currentId = journal.parentId
-  while (currentId) {
-    if (collapsedFolderIds.has(currentId)) {
-      collapsedFolderIds.delete(currentId)
-      expandedPath = true
-    }
-    const folder = settings.folders.find((item) => item.id === currentId)
-    currentId = folder?.parentId ?? null
-  }
-  if (expandedPath) persistCollapsedFolders()
+  const expandedPath = expandFolderPathForJournal(journalId)
 
   if (settings.selectedJournalId === journalId) {
     if (expandedPath) render({ preserveScroll: true })
@@ -1837,20 +2269,203 @@ function selectJournal(journalId) {
   render()
 }
 
-function renderQuoteHtml(quote) {
+function renderQuoteHtml(quote, entryId) {
   if (!quote?.text) return ''
 
   const createdAt = getQuoteCreatedAt(quote)
   const metaHtml = createdAt
     ? `<p class="entry-quote-meta">${escapeHtml(formatQuoteStamp(createdAt))}</p>`
     : ''
-
-  return `
-    <div class="entry-quote">
-      ${metaHtml}
+  const expanded = entryId ? expandedQuoteIds.has(entryId) : false
+  const clampHtml = `
+    <div class="entry-quote-clamp${expanded ? ' is-expanded' : ''}">
       <p class="entry-quote-text">${escapeHtml(quote.text)}</p>
     </div>
   `
+  const toggleHtml = `
+    <button
+      type="button"
+      class="entry-quote-toggle"
+      data-action="toggle-quote"
+      aria-expanded="${expanded ? 'true' : 'false'}"
+      hidden
+    >${expanded ? 'Show less' : 'Show more'}</button>
+  `
+  const bodyHtml = `${metaHtml}${clampHtml}`
+
+  if (quote.sourceId) {
+    return `
+      <div
+        class="entry-quote${expanded ? ' is-expanded' : ''}"
+        data-quote-clamp
+      >
+        <div
+          class="entry-quote-hit is-jumpable"
+          data-action="jump-quote"
+          role="button"
+          tabindex="0"
+          aria-label="Go to original entry"
+        >
+          ${bodyHtml}
+        </div>
+        ${toggleHtml}
+      </div>
+    `
+  }
+
+  return `
+    <div
+      class="entry-quote${expanded ? ' is-expanded' : ''}"
+      data-quote-clamp
+    >
+      ${bodyHtml}
+      ${toggleHtml}
+    </div>
+  `
+}
+
+function enhanceCollapsibleQuotes() {
+  for (const quoteEl of feedEl.querySelectorAll('[data-quote-clamp]')) {
+    const clamp = quoteEl.querySelector('.entry-quote-clamp')
+    const toggle = quoteEl.querySelector('[data-action="toggle-quote"]')
+    if (!clamp || !toggle) continue
+
+    const entryId = quoteEl.closest('.entry')?.dataset.id
+    const expanded = entryId ? expandedQuoteIds.has(entryId) : false
+
+    quoteEl.classList.toggle('is-expanded', expanded)
+    clamp.classList.toggle('is-expanded', expanded)
+
+    if (expanded) {
+      quoteEl.classList.add('is-collapsible')
+      toggle.hidden = false
+      toggle.textContent = 'Show less'
+      toggle.setAttribute('aria-expanded', 'true')
+      continue
+    }
+
+    clamp.classList.remove('is-expanded')
+    const overflows = clamp.scrollHeight > clamp.clientHeight + 1
+
+    if (overflows) {
+      quoteEl.classList.add('is-collapsible')
+      toggle.hidden = false
+      toggle.textContent = 'Show more'
+      toggle.setAttribute('aria-expanded', 'false')
+    } else {
+      quoteEl.classList.remove('is-collapsible')
+      clamp.classList.add('is-expanded')
+      toggle.hidden = true
+      toggle.textContent = 'Show more'
+      toggle.setAttribute('aria-expanded', 'false')
+    }
+  }
+}
+
+function toggleQuoteExpand(entryId) {
+  if (!entryId) return
+  if (expandedQuoteIds.has(entryId)) {
+    expandedQuoteIds.delete(entryId)
+  } else {
+    expandedQuoteIds.add(entryId)
+  }
+  render({ preserveScroll: true })
+}
+
+/** @type {ReturnType<typeof setTimeout> | null} */
+let highlightEntryTimer = null
+
+function expandFolderPathForJournal(journalId) {
+  const journal = settings.journals.find((item) => item.id === journalId)
+  if (!journal) return false
+
+  let expandedPath = false
+  let currentId = journal.parentId
+  while (currentId) {
+    if (collapsedFolderIds.has(currentId)) {
+      collapsedFolderIds.delete(currentId)
+      expandedPath = true
+    }
+    const folder = settings.folders.find((item) => item.id === currentId)
+    currentId = folder?.parentId ?? null
+  }
+  if (expandedPath) persistCollapsedFolders()
+  return expandedPath
+}
+
+function highlightAndScrollToEntry(entryId) {
+  const entryEl = feedEl.querySelector(`.entry[data-id="${CSS.escape(entryId)}"]`)
+  if (!entryEl) return
+
+  for (const el of feedEl.querySelectorAll('.entry.is-highlighted')) {
+    el.classList.remove('is-highlighted')
+  }
+
+  // Restart the flash if the same entry is jumped to again.
+  void entryEl.offsetWidth
+  entryEl.classList.add('is-highlighted')
+
+  clearTimeout(highlightEntryTimer)
+  highlightEntryTimer = setTimeout(() => {
+    entryEl.classList.remove('is-highlighted')
+    highlightEntryTimer = null
+  }, 1600)
+
+  const entryRect = entryEl.getBoundingClientRect()
+  const feedRect = feedEl.getBoundingClientRect()
+  const nextTop =
+    feedEl.scrollTop +
+    (entryRect.top - feedRect.top) -
+    feedRect.height / 2 +
+    entryRect.height / 2
+
+  feedEl.scrollTo({
+    top: Math.max(0, nextTop),
+    behavior: 'smooth',
+  })
+}
+
+function jumpToQuotedEntry(sourceId) {
+  if (!sourceId) return
+
+  const source = entries.find((item) => item.id === sourceId)
+  if (!source) return
+
+  closeContextMenu()
+
+  const wasSettings = currentView === 'settings'
+  if (wasSettings) currentView = 'journal'
+
+  const expandedPath = expandFolderPathForJournal(
+    source.journalId || settings.selectedJournalId,
+  )
+
+  let needsRender = wasSettings || expandedPath
+
+  if (
+    source.journalId &&
+    source.journalId !== settings.selectedJournalId
+  ) {
+    settings.selectedJournalId = source.journalId
+    saveSettings()
+    needsRender = true
+  }
+
+  const dayKey = getDayKey(new Date(source.createdAt))
+  if (settings.viewMode === VIEW_MODE_DAY && selectedDayKey !== dayKey) {
+    selectedDayKey = dayKey
+    needsRender = true
+  }
+
+  if (needsRender) {
+    render({ preserveScroll: true })
+  }
+
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      highlightAndScrollToEntry(source.id)
+    })
+  })
 }
 
 function renderHistoryHtml(entry) {
@@ -1883,9 +2498,64 @@ function renderHistoryHtml(entry) {
   return `<div class="entry-history" aria-label="Edit history">${items}</div>`
 }
 
+function renderCopiedFromHtml(copiedFrom) {
+  if (!copiedFrom?.sourceId) return ''
+
+  const sourceExists = entries.some((item) => item.id === copiedFrom.sourceId)
+  const label = formatCopiedFromNote(copiedFrom)
+
+  if (!sourceExists) {
+    return `<p class="entry-provenance">${escapeHtml(label)}</p>`
+  }
+
+  return `
+    <button
+      type="button"
+      class="entry-provenance is-jumpable"
+      data-action="jump-copied-from"
+      aria-label="Go to original entry"
+    >${escapeHtml(label)}</button>
+  `
+}
+
+function renderMovedFromHtml(movedFrom) {
+  if (!movedFrom?.journalName) return ''
+  return `<p class="entry-provenance">${escapeHtml(formatMovedFromNote(movedFrom))}</p>`
+}
+
 function renderEntry(entry) {
+  if (isAnnouncementEntry(entry)) {
+    return `
+      <article
+        class="entry is-announcement"
+        data-id="${escapeHtml(entry.id)}"
+        data-kind="announcement"
+      >
+        <div class="entry-actions">
+          <button
+            type="button"
+            class="entry-action"
+            data-action="menu"
+            aria-label="Announcement menu"
+            aria-haspopup="menu"
+          >
+            <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+              <path fill="currentColor" d="M12 8a2 2 0 1 0 0-4 2 2 0 0 0 0 4zm0 2a2 2 0 1 0 0 4 2 2 0 0 0 0-4zm0 6a2 2 0 1 0 0 4 2 2 0 0 0 0-4z" />
+            </svg>
+          </button>
+        </div>
+        <div class="entry-body">
+          <p class="entry-announcement">${escapeHtml(entry.text)}</p>
+          <p class="entry-announcement-time">${escapeHtml(formatAnnouncementStamp(entry.createdAt))}</p>
+        </div>
+      </article>
+    `
+  }
+
   const date = new Date(entry.createdAt)
-  const quoteHtml = renderQuoteHtml(entry.quote)
+  const quoteHtml = renderQuoteHtml(entry.quote, entry.id)
+  const copiedFromHtml = renderCopiedFromHtml(entry.copiedFrom)
+  const movedFromHtml = renderMovedFromHtml(entry.movedFrom)
   const historyHtml = renderHistoryHtml(entry)
   return `
     <article class="entry${historyEntryId === entry.id ? ' is-history-open' : ''}" data-id="${escapeHtml(entry.id)}">
@@ -1909,6 +2579,8 @@ function renderEntry(entry) {
           data-action="edit-time"
           aria-label="Edit time ${escapeHtml(formatEntryTime(date))}"
         >${escapeHtml(formatEntryTime(date))}</button>
+        ${copiedFromHtml}
+        ${movedFromHtml}
         ${quoteHtml}
         <p class="entry-text">${escapeHtml(entry.text)}</p>
         ${historyHtml}
@@ -2115,21 +2787,32 @@ function renderTimelineFeed(groups) {
     .join('')
 }
 
-function updateSettingsMenu() {
-  for (const item of settingsMenuEl.querySelectorAll('[data-view-mode]')) {
+function syncSettingsUi() {
+  for (const item of viewModeSegmentEl.querySelectorAll('[data-view-mode]')) {
     const checked = item.dataset.viewMode === settings.viewMode
-    item.classList.toggle('is-active', checked)
     item.setAttribute('aria-checked', checked ? 'true' : 'false')
   }
+  showWeekdayEl.checked = !!settings.showWeekday
 }
 
 function render({ preserveScroll = false } = {}) {
   const scrollTop = feedEl.scrollTop
   ensureSelectedJournal()
-  const groups = getDayGroups()
 
+  const showSettings = currentView === 'settings'
+  appEl.classList.toggle('is-settings-mode', showSettings)
   appEl.dataset.mode = settings.viewMode
-  updateSettingsMenu()
+  settingsOpenEl.hidden = showSettings
+  settingsCloseEl.hidden = !showSettings
+  settingsViewEl.hidden = !showSettings
+  journalViewEl.hidden = showSettings
+
+  if (showSettings) {
+    syncSettingsUi()
+    return
+  }
+
+  const groups = getDayGroups()
 
   if (settings.viewMode === VIEW_MODE_DAY) {
     ensureSelectedDay(groups)
@@ -2149,37 +2832,51 @@ function render({ preserveScroll = false } = {}) {
   } else {
     feedEl.scrollTop = scrollTop
   }
+
+  enhanceCollapsibleQuotes()
 }
 
-function openSettingsMenu() {
-  settingsMenuEl.hidden = false
-  settingsOpenEl.setAttribute('aria-expanded', 'true')
+function openSettings() {
+  currentView = 'settings'
+  closeContextMenu()
+  render({ preserveScroll: true })
 }
 
-function closeSettingsMenu() {
-  settingsMenuEl.hidden = true
-  settingsOpenEl.setAttribute('aria-expanded', 'false')
-}
-
-function toggleSettingsMenu() {
-  if (settingsMenuEl.hidden) {
-    openSettingsMenu()
-  } else {
-    closeSettingsMenu()
-  }
+function closeSettings() {
+  if (currentView !== 'settings') return
+  currentView = 'journal'
+  render({ preserveScroll: true })
+  inputEl.focus()
 }
 
 function setViewMode(mode) {
   if (mode !== VIEW_MODE_DAY && mode !== VIEW_MODE_TIMELINE) return
   if (settings.viewMode === mode) {
-    closeSettingsMenu()
+    syncSettingsUi()
     return
   }
 
   settings.viewMode = mode
   saveSettings()
-  closeSettingsMenu()
+  if (currentView === 'settings') {
+    syncSettingsUi()
+    return
+  }
   render()
+}
+
+function setShowWeekday(enabled) {
+  const next = !!enabled
+  if (settings.showWeekday === next) {
+    showWeekdayEl.checked = next
+    return
+  }
+  settings.showWeekday = next
+  saveSettings()
+  showWeekdayEl.checked = next
+  if (currentView === 'journal') {
+    render({ preserveScroll: true })
+  }
 }
 
 function submitEntry(text = inputEl.value) {
@@ -2266,7 +2963,7 @@ async function pasteAndSubmit() {
 
 function startEditTime(id) {
   const entry = entries.find((item) => item.id === id)
-  if (!entry) return
+  if (!entry || isAnnouncementEntry(entry)) return
 
   openBackdateSheet({
     mode: 'edit',
@@ -2294,9 +2991,9 @@ document.addEventListener('keydown', (event) => {
     return
   }
 
-  if (event.key === 'Escape' && !settingsMenuEl.hidden) {
+  if (event.key === 'Escape' && currentView === 'settings') {
     event.preventDefault()
-    closeSettingsMenu()
+    closeSettings()
     return
   }
 
@@ -2317,7 +3014,8 @@ document.addEventListener('keydown', (event) => {
     !event.altKey &&
     !backdateSession &&
     !nameSession &&
-    contextMenuEl.hidden
+    contextMenuEl.hidden &&
+    currentView === 'journal'
   ) {
     const typing = isTypingTarget(event.target)
     const composerIdle =
@@ -2374,10 +3072,6 @@ document.addEventListener('pointerdown', (event) => {
   if (!contextMenuEl.hidden && !contextMenuEl.contains(event.target)) {
     closeContextMenu()
   }
-
-  if (settingsMenuEl.hidden) return
-  if (settingsWrapEl.contains(event.target)) return
-  closeSettingsMenu()
 })
 
 inputEl.addEventListener('keydown', (event) => {
@@ -2409,13 +3103,21 @@ pasteBtnEl.addEventListener('click', pasteAndSubmit)
 
 settingsOpenEl.addEventListener('click', (event) => {
   event.stopPropagation()
-  toggleSettingsMenu()
+  openSettings()
 })
 
-settingsMenuEl.addEventListener('click', (event) => {
+settingsCloseEl.addEventListener('click', () => {
+  closeSettings()
+})
+
+viewModeSegmentEl.addEventListener('click', (event) => {
   const item = event.target.closest('[data-view-mode]')
-  if (!item || !settingsMenuEl.contains(item)) return
+  if (!item || !viewModeSegmentEl.contains(item)) return
   setViewMode(item.dataset.viewMode)
+})
+
+showWeekdayEl.addEventListener('change', () => {
+  setShowWeekday(showWeekdayEl.checked)
 })
 
 journalTabsEl.addEventListener('click', (event) => {
@@ -2427,7 +3129,12 @@ journalTabsEl.addEventListener('click', (event) => {
 contextMenuEl.addEventListener('click', (event) => {
   const item = event.target.closest('[data-action]')
   if (!item || !contextMenuEl.contains(item)) return
-  handleContextMenuAction(item.dataset.action, item.dataset.folderId ?? null)
+  if (item.disabled) return
+  handleContextMenuAction(
+    item.dataset.action,
+    item.dataset.folderId ?? null,
+    item.dataset.journalId ?? null,
+  )
 })
 
 sidebarEl.addEventListener('contextmenu', (event) => {
@@ -2631,7 +3338,45 @@ feedEl.addEventListener('click', (event) => {
   } else if (action === 'toggle-history-item') {
     const index = Number(button.dataset.historyIndex)
     if (Number.isInteger(index)) toggleHistoryItem(id, index)
+  } else if (action === 'toggle-quote') {
+    event.stopPropagation()
+    toggleQuoteExpand(id)
+  } else if (action === 'jump-quote') {
+    const entry = entries.find((item) => item.id === id)
+    if (entry?.quote?.sourceId) jumpToQuotedEntry(entry.quote.sourceId)
+  } else if (action === 'jump-copied-from') {
+    const entry = entries.find((item) => item.id === id)
+    if (entry?.copiedFrom?.sourceId) {
+      jumpToQuotedEntry(entry.copiedFrom.sourceId)
+    }
   }
+})
+
+feedEl.addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter' && event.key !== ' ') return
+  const target = event.target.closest('[data-action="jump-quote"]')
+  if (!target || !feedEl.contains(target)) return
+  event.preventDefault()
+  const entryEl = target.closest('.entry')
+  if (!entryEl || !feedEl.contains(entryEl)) return
+  const entry = entries.find((item) => item.id === entryEl.dataset.id)
+  if (entry?.quote?.sourceId) jumpToQuotedEntry(entry.quote.sourceId)
+})
+
+composerQuoteEl.addEventListener('click', (event) => {
+  if (event.target.closest('.composer-quote-dismiss')) return
+  if (event.target.closest('.composer-quote-toggle')) return
+  if (!pendingQuote?.sourceId) return
+  jumpToQuotedEntry(pendingQuote.sourceId)
+})
+
+composerQuoteEl.addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter' && event.key !== ' ') return
+  if (event.target.closest('.composer-quote-dismiss')) return
+  if (event.target.closest('.composer-quote-toggle')) return
+  if (!pendingQuote?.sourceId) return
+  event.preventDefault()
+  jumpToQuotedEntry(pendingQuote.sourceId)
 })
 
 nameCancelEl.addEventListener('click', closeNameSheet)
@@ -2674,6 +3419,12 @@ composerEl.addEventListener('submit', (event) => {
 composerQuoteDismissEl.addEventListener('click', () => {
   clearPendingQuote()
   inputEl.focus()
+})
+
+composerQuoteToggleEl.addEventListener('click', (event) => {
+  event.stopPropagation()
+  composerQuoteExpanded = !composerQuoteExpanded
+  enhanceComposerQuoteClamp()
 })
 
 boot()
