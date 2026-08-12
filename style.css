@@ -783,6 +783,21 @@ body {
   }
 }
 
+@keyframes entry-transfer-in {
+  from {
+    opacity: 0;
+    transform: translateX(-1.25rem);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.entry.is-transfer-enter {
+  animation: entry-transfer-in 0.38s ease both;
+}
+
 .entry-actions {
   flex-shrink: 0;
   display: flex;

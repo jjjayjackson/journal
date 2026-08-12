@@ -6,6 +6,7 @@ const VIEW_MODE_DAY = 'day'
 const VIEW_MODE_TIMELINE = 'timeline'
 const DEFAULT_JOURNAL_ID = 'journal-default'
 const PERSIST_DEBOUNCE_MS = 400
+const TRANSFER_POLL_MS = 2500
 
 const supabase = window.supabase.createClient(
   window.JOURNAL_SUPABASE.url,
@@ -28,6 +29,13 @@ const supabase = window.supabase.createClient(
 
 let journalPersistTimer = null
 let journalPersistChain = Promise.resolve()
+/** Explicit remote deletes only — never wipe unknown remote rows (e.g. Draft transfers). */
+/** @type {Set<string>} */
+const pendingRemoteDeletes = new Set()
+/** Entry ids that should slide in from the left on next paint. */
+/** @type {Set<string>} */
+const pendingTransferEnterIds = new Set()
+let transferPollTimer = null
 
 const appEl = document.getElementById('app')
 const sidebarEl = document.getElementById('sidebar')
@@ -210,6 +218,52 @@ function normalizeMovedFrom(movedFrom) {
   return normalized
 }
 
+function normalizeTransferredFrom(transferredFrom) {
+  if (!transferredFrom || typeof transferredFrom !== 'object') return null
+
+  const sourceApp =
+    typeof transferredFrom.sourceApp === 'string'
+      ? transferredFrom.sourceApp.trim()
+      : ''
+  if (!sourceApp) return null
+
+  const normalized = { sourceApp }
+
+  if (typeof transferredFrom.transferId === 'string' && transferredFrom.transferId) {
+    normalized.transferId = transferredFrom.transferId
+  }
+
+  if (
+    typeof transferredFrom.destinationApp === 'string' &&
+    transferredFrom.destinationApp.trim()
+  ) {
+    normalized.destinationApp = transferredFrom.destinationApp.trim()
+  }
+
+  if (
+    typeof transferredFrom.sourceEntryId === 'string' &&
+    transferredFrom.sourceEntryId
+  ) {
+    normalized.sourceEntryId = transferredFrom.sourceEntryId
+  }
+
+  if (typeof transferredFrom.transferredAt === 'string') {
+    const transferredAt = new Date(transferredFrom.transferredAt)
+    if (!Number.isNaN(transferredAt.getTime())) {
+      normalized.transferredAt = transferredFrom.transferredAt
+    }
+  }
+
+  if (typeof transferredFrom.createdAt === 'string') {
+    const createdAt = new Date(transferredFrom.createdAt)
+    if (!Number.isNaN(createdAt.getTime())) {
+      normalized.createdAt = transferredFrom.createdAt
+    }
+  }
+
+  return normalized
+}
+
 function normalizeHistoryItem(item) {
   if (!item || typeof item !== 'object') return null
   if (typeof item.text !== 'string' || typeof item.editedAt !== 'string') return null
@@ -276,6 +330,9 @@ function normalizeEntry(entry, fallbackJournalId) {
 
   const movedFrom = normalizeMovedFrom(entry.movedFrom)
   if (movedFrom) normalized.movedFrom = movedFrom
+
+  const transferredFrom = normalizeTransferredFrom(entry.transferredFrom)
+  if (transferredFrom) normalized.transferredFrom = transferredFrom
 
   if (Array.isArray(entry.history)) {
     const history = entry.history.map(normalizeHistoryItem).filter(Boolean)
@@ -352,6 +409,7 @@ function entryRowFromState(entry) {
     quote: entry.quote || null,
     copied_from: entry.copiedFrom || null,
     moved_from: entry.movedFrom || null,
+    transferred_from: entry.transferredFrom || null,
     history: Array.isArray(entry.history) ? entry.history : [],
     updated_at: new Date().toISOString(),
   }
@@ -368,6 +426,7 @@ function entryFromRow(row, fallbackJournalId) {
       quote: row.quote || undefined,
       copiedFrom: row.copied_from || undefined,
       movedFrom: row.moved_from || undefined,
+      transferredFrom: row.transferred_from || undefined,
       history: row.history || undefined,
     },
     fallbackJournalId,
@@ -478,21 +537,32 @@ async function loadJournalState() {
   }
 }
 
-async function persistEntriesToSupabase(nextEntries = entries) {
-  const desiredIds = new Set(nextEntries.map((entry) => entry.id))
-  const { data: existing, error: existingError } = await supabase
-    .from('journal_entries')
-    .select('id')
-  if (existingError) throw existingError
+async function persistEntriesToSupabase(nextEntries = entries, options = {}) {
+  const deleteIds = Array.isArray(options.deleteIds) ? options.deleteIds : []
+  const replaceAll = options.replaceAll === true
 
-  const toDelete = (existing || [])
-    .map((row) => row.id)
-    .filter((id) => !desiredIds.has(id))
-  if (toDelete.length > 0) {
+  if (replaceAll) {
+    const desiredIds = new Set(nextEntries.map((entry) => entry.id))
+    const { data: existing, error: existingError } = await supabase
+      .from('journal_entries')
+      .select('id')
+    if (existingError) throw existingError
+
+    const toDelete = (existing || [])
+      .map((row) => row.id)
+      .filter((id) => !desiredIds.has(id))
+    if (toDelete.length > 0) {
+      const { error: deleteError } = await supabase
+        .from('journal_entries')
+        .delete()
+        .in('id', toDelete)
+      if (deleteError) throw deleteError
+    }
+  } else if (deleteIds.length > 0) {
     const { error: deleteError } = await supabase
       .from('journal_entries')
       .delete()
-      .in('id', toDelete)
+      .in('id', deleteIds)
     if (deleteError) throw deleteError
   }
 
@@ -502,6 +572,14 @@ async function persistEntriesToSupabase(nextEntries = entries) {
     .from('journal_entries')
     .upsert(nextEntries.map(entryRowFromState))
   if (upsertError) throw upsertError
+}
+
+function queueRemoteDelete(id) {
+  if (typeof id === 'string' && id) pendingRemoteDeletes.add(id)
+}
+
+function queueRemoteDeletes(ids) {
+  for (const id of ids) queueRemoteDelete(id)
 }
 
 async function persistSettingsToSupabase(nextSettings = settings) {
@@ -582,11 +660,15 @@ function queueJournalPersist() {
     journalPersistTimer = null
     const settingsSnapshot = structuredClone(settings)
     const entriesSnapshot = structuredClone(entries)
+    const deleteIdsSnapshot = [...pendingRemoteDeletes]
     journalPersistChain = journalPersistChain
       .then(async () => {
         // Folders/journals first so entry FKs stay valid.
         await persistSettingsToSupabase(settingsSnapshot)
-        await persistEntriesToSupabase(entriesSnapshot)
+        await persistEntriesToSupabase(entriesSnapshot, {
+          deleteIds: deleteIdsSnapshot,
+        })
+        for (const id of deleteIdsSnapshot) pendingRemoteDeletes.delete(id)
       })
       .catch((err) => console.error('Failed to save journal to Supabase:', err))
   }, PERSIST_DEBOUNCE_MS)
@@ -756,7 +838,7 @@ async function migrateFromLocalStorageIfNeeded() {
   settings = localSettings
   const localEntries = loadEntriesFromLocal()
   await persistSettingsToSupabase(localSettings)
-  await persistEntriesToSupabase(localEntries)
+  await persistEntriesToSupabase(localEntries, { replaceAll: true })
   console.info('Migration complete.')
 }
 
@@ -766,10 +848,14 @@ async function flushAllPendingPersists() {
     journalPersistTimer = null
     const settingsSnapshot = structuredClone(settings)
     const entriesSnapshot = structuredClone(entries)
+    const deleteIdsSnapshot = [...pendingRemoteDeletes]
     journalPersistChain = journalPersistChain
       .then(async () => {
         await persistSettingsToSupabase(settingsSnapshot)
-        await persistEntriesToSupabase(entriesSnapshot)
+        await persistEntriesToSupabase(entriesSnapshot, {
+          deleteIds: deleteIdsSnapshot,
+        })
+        for (const id of deleteIdsSnapshot) pendingRemoteDeletes.delete(id)
       })
       .catch((err) => console.error('Failed to save journal to Supabase:', err))
   }
@@ -802,6 +888,53 @@ async function boot() {
   render()
   resetComposerHeight()
   inputEl.focus()
+  startTransferPolling()
+}
+
+/**
+ * Pull any journal rows created outside this tab (e.g. Drafts → Journal transfers)
+ * and merge them into local state without wiping local-only pending writes.
+ */
+async function mergeRemoteTransfers() {
+  try {
+    const fallbackJournalId = settings.journals[0]?.id ?? DEFAULT_JOURNAL_ID
+    const { data: rows, error } = await supabase
+      .from('journal_entries')
+      .select('*')
+      .order('created_at', { ascending: true })
+    if (error) throw error
+
+    const localIds = new Set(entries.map((entry) => entry.id))
+    const incoming = []
+    for (const row of rows || []) {
+      if (localIds.has(row.id)) continue
+      if (pendingRemoteDeletes.has(row.id)) continue
+      const entry = entryFromRow(row, fallbackJournalId)
+      if (!entry) continue
+      incoming.push(entry)
+      if (entry.transferredFrom) {
+        pendingTransferEnterIds.add(entry.id)
+      }
+    }
+
+    if (incoming.length === 0) return false
+
+    entries = [...entries, ...incoming]
+    writeEntriesLocal()
+    render()
+    return true
+  } catch (err) {
+    console.warn('Failed to merge remote journal entries:', err)
+    return false
+  }
+}
+
+function startTransferPolling() {
+  if (transferPollTimer) return
+  transferPollTimer = window.setInterval(() => {
+    if (document.visibilityState === 'hidden') return
+    void mergeRemoteTransfers()
+  }, TRANSFER_POLL_MS)
 }
 
 window.addEventListener('beforeunload', () => {
@@ -811,7 +944,13 @@ window.addEventListener('beforeunload', () => {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') {
     void flushAllPendingPersists()
+    return
   }
+  void mergeRemoteTransfers()
+})
+
+window.addEventListener('focus', () => {
+  void mergeRemoteTransfers()
 })
 
 function createEntry(text, createdAt = new Date().toISOString(), quote = null) {
@@ -1579,6 +1718,39 @@ function formatMovedFromNote(movedFrom) {
   return `Moved from ${journalName}`
 }
 
+/** Compact stamp for cross-app provenance: 8.11.26 1545 */
+function formatTransferStamp(iso) {
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return ''
+  const month = date.getMonth() + 1
+  const day = date.getDate()
+  const year = String(date.getFullYear()).slice(-2)
+  const hours = String(date.getHours()).padStart(2, '0')
+  const minutes = String(date.getMinutes()).padStart(2, '0')
+  return `${month}.${day}.${year} ${hours}${minutes}`
+}
+
+function formatTransferredFromNote(transferredFrom) {
+  const sourceApp = transferredFrom?.sourceApp?.trim() || 'another app'
+  const transferredStamp = transferredFrom?.transferredAt
+    ? formatTransferStamp(transferredFrom.transferredAt)
+    : ''
+  const createdStamp = transferredFrom?.createdAt
+    ? formatTransferStamp(transferredFrom.createdAt)
+    : ''
+
+  if (transferredStamp && createdStamp) {
+    return `Transferred from ${sourceApp} ${transferredStamp} • Created ${createdStamp}`
+  }
+  if (transferredStamp) {
+    return `Transferred from ${sourceApp} ${transferredStamp}`
+  }
+  if (createdStamp) {
+    return `Transferred from ${sourceApp} • Created ${createdStamp}`
+  }
+  return `Transferred from ${sourceApp}`
+}
+
 function formatHistoryTime(iso) {
   const date = new Date(iso)
   if (Number.isNaN(date.getTime())) return ''
@@ -1961,6 +2133,7 @@ function startEdit(id) {
 
 function deleteEntry(id) {
   entries = entries.filter((item) => item.id !== id)
+  queueRemoteDelete(id)
   if (editingId === id) {
     editingId = null
     inputEl.value = ''
@@ -2169,6 +2342,10 @@ function deleteJournal(journalId) {
   if (!confirmed) return
 
   settings.journals = settings.journals.filter((item) => item.id !== journalId)
+  const removedIds = entries
+    .filter((entry) => entry.journalId === journalId)
+    .map((entry) => entry.id)
+  queueRemoteDeletes(removedIds)
   entries = entries.filter((entry) => entry.journalId !== journalId)
 
   if (settings.selectedJournalId === journalId) {
@@ -2212,6 +2389,10 @@ function deleteFolder(folderId) {
 
   settings.folders = settings.folders.filter((item) => !folderIdSet.has(item.id))
   settings.journals = settings.journals.filter((item) => !journalIdSet.has(item.id))
+  const removedIds = entries
+    .filter((entry) => journalIdSet.has(entry.journalId))
+    .map((entry) => entry.id)
+  queueRemoteDeletes(removedIds)
   entries = entries.filter((entry) => !journalIdSet.has(entry.journalId))
 
   for (const id of folderIds) {
@@ -2523,6 +2704,11 @@ function renderMovedFromHtml(movedFrom) {
   return `<p class="entry-provenance">${escapeHtml(formatMovedFromNote(movedFrom))}</p>`
 }
 
+function renderTransferredFromHtml(transferredFrom) {
+  if (!transferredFrom?.sourceApp) return ''
+  return `<p class="entry-provenance">${escapeHtml(formatTransferredFromNote(transferredFrom))}</p>`
+}
+
 function renderEntry(entry) {
   if (isAnnouncementEntry(entry)) {
     return `
@@ -2556,9 +2742,13 @@ function renderEntry(entry) {
   const quoteHtml = renderQuoteHtml(entry.quote, entry.id)
   const copiedFromHtml = renderCopiedFromHtml(entry.copiedFrom)
   const movedFromHtml = renderMovedFromHtml(entry.movedFrom)
+  const transferredFromHtml = renderTransferredFromHtml(entry.transferredFrom)
   const historyHtml = renderHistoryHtml(entry)
+  const transferEnterClass = pendingTransferEnterIds.has(entry.id)
+    ? ' is-transfer-enter'
+    : ''
   return `
-    <article class="entry${historyEntryId === entry.id ? ' is-history-open' : ''}" data-id="${escapeHtml(entry.id)}">
+    <article class="entry${historyEntryId === entry.id ? ' is-history-open' : ''}${transferEnterClass}" data-id="${escapeHtml(entry.id)}">
       <div class="entry-actions">
         <button
           type="button"
@@ -2581,6 +2771,7 @@ function renderEntry(entry) {
         >${escapeHtml(formatEntryTime(date))}</button>
         ${copiedFromHtml}
         ${movedFromHtml}
+        ${transferredFromHtml}
         ${quoteHtml}
         <p class="entry-text">${escapeHtml(entry.text)}</p>
         ${historyHtml}
@@ -2834,6 +3025,21 @@ function render({ preserveScroll = false } = {}) {
   }
 
   enhanceCollapsibleQuotes()
+
+  // Clear transfer enter flags after this paint so re-renders don't replay.
+  if (pendingTransferEnterIds.size > 0) {
+    const enteringIds = [...pendingTransferEnterIds]
+    pendingTransferEnterIds.clear()
+    requestAnimationFrame(() => {
+      for (const id of enteringIds) {
+        const el = feedEl.querySelector(`.entry[data-id="${CSS.escape(id)}"]`)
+        if (!el) continue
+        const clear = () => el.classList.remove('is-transfer-enter')
+        el.addEventListener('animationend', clear, { once: true })
+        window.setTimeout(clear, 600)
+      }
+    })
+  }
 }
 
 function openSettings() {
