@@ -2,7 +2,6 @@ const STORAGE_KEY = 'journal-mvp:entries'
 const ENTRY_KIND_ENTRY = 'entry'
 const ENTRY_KIND_ANNOUNCEMENT = 'announcement'
 const SETTINGS_KEY = 'journal-mvp:settings'
-const VIEW_MODE_DAY = 'day'
 const VIEW_MODE_TIMELINE = 'timeline'
 const DEFAULT_JOURNAL_ID = 'journal-default'
 const PERSIST_DEBOUNCE_MS = 400
@@ -40,7 +39,6 @@ let transferPollTimer = null
 const appEl = document.getElementById('app')
 const sidebarEl = document.getElementById('sidebar')
 const journalViewEl = document.getElementById('journal-view')
-const journalTabsEl = document.getElementById('journal-tabs')
 const feedEl = document.getElementById('feed')
 const composerEl = document.getElementById('composer')
 const inputEl = document.getElementById('entry-input')
@@ -54,7 +52,6 @@ const composerQuoteDismissEl = document.getElementById('composer-quote-dismiss')
 const settingsOpenEl = document.getElementById('settings-open')
 const settingsCloseEl = document.getElementById('settings-close')
 const settingsViewEl = document.getElementById('settings-view')
-const viewModeSegmentEl = document.getElementById('view-mode-segment')
 const showWeekdayEl = document.getElementById('show-weekday')
 const nameSheetEl = document.getElementById('name-sheet')
 const nameTitleEl = document.getElementById('name-title')
@@ -71,7 +68,6 @@ const contextMenuEl = document.getElementById('context-menu')
 
 let settings = normalizeSettings(null)
 let entries = []
-let selectedDayKey = null
 let editingId = null
 /** @type {{ text: string, sourceId: string, createdAt?: string } | null} */
 let pendingQuote = null
@@ -502,7 +498,6 @@ async function loadJournalStateFromSupabase() {
 
   const localSettings = loadSettingsFromLocal()
   const nextSettings = normalizeSettings({
-    viewMode: settingsRow?.view_mode,
     showWeekday:
       typeof settingsRow?.show_weekday === 'boolean'
         ? settingsRow.show_weekday
@@ -612,7 +607,7 @@ async function persistSettingsToSupabase(nextSettings = settings) {
 
   const settingsPayload = {
     id: 1,
-    view_mode: nextSettings.viewMode,
+    view_mode: VIEW_MODE_TIMELINE,
     show_weekday: !!nextSettings.showWeekday,
     selected_journal_id: nextSettings.selectedJournalId,
     collapsed_folder_ids: nextSettings.collapsedFolderIds || [],
@@ -679,8 +674,6 @@ function saveEntries() {
 }
 
 function normalizeSettings(value) {
-  const mode =
-    value?.viewMode === VIEW_MODE_DAY ? VIEW_MODE_DAY : VIEW_MODE_TIMELINE
   const showWeekday = value?.showWeekday === true
 
   let folders = Array.isArray(value?.folders)
@@ -728,7 +721,6 @@ function normalizeSettings(value) {
     : []
 
   return {
-    viewMode: mode,
     showWeekday,
     folders,
     journals,
@@ -770,7 +762,6 @@ function localHasJournalData() {
     )
   const hasFolders = localSettings.folders.length > 0
   const hasCustomSettings =
-    localSettings.viewMode !== VIEW_MODE_TIMELINE ||
     localSettings.showWeekday ||
     localSettings.selectedJournalId !== DEFAULT_JOURNAL_ID ||
     localSettings.collapsedFolderIds.length > 0
@@ -1149,7 +1140,7 @@ function getTreeNodes() {
   return nodes
 }
 
-/** Journals in depth-first folder order (for day tabs). */
+/** Journals in depth-first folder order. */
 function getJournalsDepthFirst() {
   const result = []
 
@@ -1458,7 +1449,7 @@ async function copyEntry(id) {
   }
 }
 
-function focusEntryInJournal(entryId, journalId, createdAt) {
+function focusEntryInJournal(entryId, journalId) {
   clearPendingQuote()
   editingId = null
   historyEntryId = null
@@ -1468,10 +1459,6 @@ function focusEntryInJournal(entryId, journalId, createdAt) {
 
   expandFolderPathForJournal(journalId)
   settings.selectedJournalId = journalId
-
-  if (settings.viewMode === VIEW_MODE_DAY) {
-    selectedDayKey = getDayKey(new Date(createdAt))
-  }
 
   saveSettings()
   render()
@@ -1511,7 +1498,7 @@ function copyEntryToJournal(entryId, targetJournalId) {
   lastMarkedUsedJournalId = targetJournalId
 
   saveEntries()
-  focusEntryInJournal(copy.id, targetJournalId, copy.createdAt)
+  focusEntryInJournal(copy.id, targetJournalId)
 }
 
 function moveEntryToJournal(entryId, targetJournalId) {
@@ -1539,7 +1526,7 @@ function moveEntryToJournal(entryId, targetJournalId) {
   lastMarkedUsedJournalId = targetJournalId
 
   saveEntries()
-  focusEntryInJournal(entry.id, targetJournalId, entry.createdAt)
+  focusEntryInJournal(entry.id, targetJournalId)
 }
 
 function handleContextMenuAction(action, folderId, targetJournalId) {
@@ -1616,13 +1603,6 @@ function handleContextMenuAction(action, folderId, targetJournalId) {
       name: '',
     })
   }
-}
-
-function isTypingTarget(target) {
-  if (!(target instanceof Element)) return false
-  const tag = target.tagName
-  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true
-  return target.closest('[contenteditable="true"]') !== null
 }
 
 function escapeHtml(value) {
@@ -1942,12 +1922,6 @@ function fromDatetimeLocalValue(value) {
   return date.toISOString()
 }
 
-function previewText(text, maxLength = 72) {
-  const compact = text.replace(/\s+/g, ' ').trim()
-  if (compact.length <= maxLength) return compact
-  return `${compact.slice(0, maxLength - 1)}…`
-}
-
 function groupEntriesByDay(list) {
   const groups = []
   const indexByKey = new Map()
@@ -1975,19 +1949,6 @@ function getActiveEntries() {
 
 function getDayGroups() {
   return groupEntriesByDay(getActiveEntries())
-}
-
-function ensureSelectedDay(groups) {
-  if (groups.length === 0) {
-    selectedDayKey = null
-    return
-  }
-
-  if (selectedDayKey && groups.some((group) => group.key === selectedDayKey)) {
-    return
-  }
-
-  selectedDayKey = groups[groups.length - 1].key
 }
 
 function ensureSelectedJournal() {
@@ -2197,7 +2158,6 @@ function confirmBackdateSheet() {
       backdateSession.quote ?? null,
     )
     entries.push(entry)
-    selectedDayKey = getDayKey(new Date(entry.createdAt))
     clearPendingQuote()
     saveEntries()
     closeBackdateSheet()
@@ -2208,7 +2168,6 @@ function confirmBackdateSheet() {
   const entry = entries.find((item) => item.id === backdateSession.entryId)
   if (entry) {
     entry.createdAt = createdAt
-    selectedDayKey = getDayKey(new Date(createdAt))
     saveEntries()
   }
 
@@ -2273,7 +2232,6 @@ function confirmNameSheet() {
     settings.journals.push(journal)
     settings.selectedJournalId = journal.id
     lastMarkedUsedJournalId = null
-    selectedDayKey = null
     if (journal.parentId) collapsedFolderIds.delete(journal.parentId)
     persistCollapsedFolders()
     saveSettings()
@@ -2321,9 +2279,6 @@ function confirmNameSheet() {
     saveEntries()
     revealAnnouncement =
       journal.id === settings.selectedJournalId && currentView === 'journal'
-    if (revealAnnouncement && settings.viewMode === VIEW_MODE_DAY) {
-      selectedDayKey = getDayKey(new Date(createdAt))
-    }
   }
 
   closeNameSheet()
@@ -2350,7 +2305,6 @@ function deleteJournal(journalId) {
 
   if (settings.selectedJournalId === journalId) {
     settings.selectedJournalId = settings.journals[0].id
-    selectedDayKey = null
   }
 
   if (editingId && !entries.some((entry) => entry.id === editingId)) {
@@ -2401,7 +2355,6 @@ function deleteFolder(folderId) {
 
   if (journalIdSet.has(settings.selectedJournalId)) {
     settings.selectedJournalId = settings.journals[0].id
-    selectedDayKey = null
   }
 
   if (editingId && !entries.some((entry) => entry.id === editingId)) {
@@ -2438,7 +2391,6 @@ function selectJournal(journalId) {
   }
 
   settings.selectedJournalId = journalId
-  selectedDayKey = null
   clearPendingQuote()
   editingId = null
   historyEntryId = null
@@ -2632,12 +2584,6 @@ function jumpToQuotedEntry(sourceId) {
     needsRender = true
   }
 
-  const dayKey = getDayKey(new Date(source.createdAt))
-  if (settings.viewMode === VIEW_MODE_DAY && selectedDayKey !== dayKey) {
-    selectedDayKey = dayKey
-    needsRender = true
-  }
-
   if (needsRender) {
     render({ preserveScroll: true })
   }
@@ -2780,67 +2726,13 @@ function renderEntry(entry) {
   `
 }
 
-function renderDayGroup(group, { showHeader = true } = {}) {
-  const header = showHeader
-    ? `<h2 class="day-header">${escapeHtml(formatDayHeader(group.date))}</h2>`
-    : ''
-
+function renderDayGroup(group) {
   return `
-    <section class="day-group${showHeader ? '' : ' day-group-plain'}">
-      ${header}
+    <section class="day-group">
+      <h2 class="day-header">${escapeHtml(formatDayHeader(group.date))}</h2>
       ${group.entries.map(renderEntry).join('')}
     </section>
   `
-}
-
-function renderDaySidebar(groups) {
-  if (groups.length === 0) {
-    sidebarEl.innerHTML = `<p class="sidebar-empty">No days yet</p>`
-    return
-  }
-
-  // Oldest at top → newest at bottom
-  sidebarEl.innerHTML = groups
-    .map((group) => {
-      const lastEntry = group.entries[group.entries.length - 1]
-      const active = group.key === selectedDayKey ? ' is-active' : ''
-      return `
-        <button
-          type="button"
-          class="sidebar-item${active}"
-          data-day-key="${escapeHtml(group.key)}"
-        >
-          <span class="sidebar-item-title">${escapeHtml(formatDayHeader(group.date))}</span>
-          <span class="sidebar-item-preview">${escapeHtml(previewText(lastEntry.text))}</span>
-        </button>
-      `
-    })
-    .join('')
-}
-
-function renderDayJournalTabs() {
-  journalTabsEl.hidden = false
-  journalTabsEl.innerHTML = getJournalsDepthFirst()
-    .map((journal) => {
-      const active =
-        journal.id === settings.selectedJournalId ? ' is-active' : ''
-      const path = getJournalPathLabel(journal)
-      return `
-        <button
-          type="button"
-          class="journal-tab${active}"
-          data-journal-id="${escapeHtml(journal.id)}"
-          data-action="select-journal"
-          title="${escapeHtml(path)}"
-        >${escapeHtml(journal.name)}</button>
-      `
-    })
-    .join('')
-}
-
-function hideDayJournalTabs() {
-  journalTabsEl.hidden = true
-  journalTabsEl.innerHTML = ''
 }
 
 const ICON_EDIT = `<svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true"><path fill="currentColor" d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z" /></svg>`
@@ -2931,7 +2823,7 @@ function renderTreeJournal(node) {
   `
 }
 
-function renderTimelineSidebar() {
+function renderSidebar() {
   const nodes = getTreeNodes()
 
   sidebarEl.innerHTML = `
@@ -2957,32 +2849,16 @@ function renderTimelineSidebar() {
   `
 }
 
-function renderFeedForDay(groups) {
-  const group = groups.find((item) => item.key === selectedDayKey)
-  if (!group) {
-    feedEl.innerHTML = `<p class="feed-empty">No entries for this day</p>`
-    return
-  }
-
-  feedEl.innerHTML = renderDayGroup(group, { showHeader: false })
-}
-
-function renderTimelineFeed(groups) {
+function renderFeed(groups) {
   if (groups.length === 0) {
     feedEl.innerHTML = `<p class="feed-empty">No entries yet</p>`
     return
   }
 
-  feedEl.innerHTML = groups
-    .map((group) => renderDayGroup(group, { showHeader: true }))
-    .join('')
+  feedEl.innerHTML = groups.map((group) => renderDayGroup(group)).join('')
 }
 
 function syncSettingsUi() {
-  for (const item of viewModeSegmentEl.querySelectorAll('[data-view-mode]')) {
-    const checked = item.dataset.viewMode === settings.viewMode
-    item.setAttribute('aria-checked', checked ? 'true' : 'false')
-  }
   showWeekdayEl.checked = !!settings.showWeekday
 }
 
@@ -2992,7 +2868,6 @@ function render({ preserveScroll = false } = {}) {
 
   const showSettings = currentView === 'settings'
   appEl.classList.toggle('is-settings-mode', showSettings)
-  appEl.dataset.mode = settings.viewMode
   settingsOpenEl.hidden = showSettings
   settingsCloseEl.hidden = !showSettings
   settingsViewEl.hidden = !showSettings
@@ -3004,25 +2879,9 @@ function render({ preserveScroll = false } = {}) {
   }
 
   const groups = getDayGroups()
-
-  if (settings.viewMode === VIEW_MODE_DAY) {
-    ensureSelectedDay(groups)
-    renderDayJournalTabs()
-    renderDaySidebar(groups)
-    renderFeedForDay(groups)
-  } else {
-    hideDayJournalTabs()
-    renderTimelineSidebar()
-    renderTimelineFeed(groups)
-  }
-
-  if (settings.viewMode === VIEW_MODE_TIMELINE) {
-    feedEl.scrollTop = preserveScroll ? scrollTop : feedEl.scrollHeight
-  } else if (!preserveScroll) {
-    feedEl.scrollTop = 0
-  } else {
-    feedEl.scrollTop = scrollTop
-  }
+  renderSidebar()
+  renderFeed(groups)
+  feedEl.scrollTop = preserveScroll ? scrollTop : feedEl.scrollHeight
 
   enhanceCollapsibleQuotes()
 
@@ -3053,22 +2912,6 @@ function closeSettings() {
   currentView = 'journal'
   render({ preserveScroll: true })
   inputEl.focus()
-}
-
-function setViewMode(mode) {
-  if (mode !== VIEW_MODE_DAY && mode !== VIEW_MODE_TIMELINE) return
-  if (settings.viewMode === mode) {
-    syncSettingsUi()
-    return
-  }
-
-  settings.viewMode = mode
-  saveSettings()
-  if (currentView === 'settings') {
-    syncSettingsUi()
-    return
-  }
-  render()
 }
 
 function setShowWeekday(enabled) {
@@ -3102,13 +2945,11 @@ function submitEntry(text = inputEl.value) {
         })
         entry.text = trimmed
       }
-      selectedDayKey = getDayKey(new Date(entry.createdAt))
     }
     editingId = null
   } else {
     const entry = createEntry(trimmed, new Date().toISOString(), pendingQuote)
     entries.push(entry)
-    selectedDayKey = getDayKey(new Date(entry.createdAt))
     clearPendingQuote()
   }
 
@@ -3151,7 +2992,6 @@ function submitPastedText(text) {
   markJournalUsed(settings.selectedJournalId)
   const entry = createEntry(trimmed, new Date().toISOString(), pendingQuote)
   entries.push(entry)
-  selectedDayKey = getDayKey(new Date(entry.createdAt))
   clearPendingQuote()
   saveEntries()
   render()
@@ -3214,38 +3054,9 @@ document.addEventListener('keydown', (event) => {
     return
   }
 
-  if (
-    !event.metaKey &&
-    !event.ctrlKey &&
-    !event.altKey &&
-    !backdateSession &&
-    !nameSession &&
-    contextMenuEl.hidden &&
-    currentView === 'journal'
-  ) {
-    const typing = isTypingTarget(event.target)
-    const composerIdle =
-      event.target === inputEl &&
-      inputEl.value.trim() === '' &&
-      !editingId &&
-      !pendingQuote
-
-    if (!typing || composerIdle) {
-      if (event.key === 't' || event.key === 'T') {
-        event.preventDefault()
-        setViewMode(VIEW_MODE_TIMELINE)
-        return
-      }
-      if (event.key === 'd' || event.key === 'D') {
-        event.preventDefault()
-        setViewMode(VIEW_MODE_DAY)
-        return
-      }
-    }
-  }
-
   if (event.repeat) return
-  if (event.metaKey || event.ctrlKey || event.altKey) return
+  if (event.altKey || event.shiftKey) return
+  if (!(event.metaKey || event.ctrlKey)) return
   if (!shouldArmPasteModifierKey()) return
 
   if (event.key === 'b' || event.key === 'B') {
@@ -3265,6 +3076,10 @@ document.addEventListener('keyup', (event) => {
     bHeld = false
   }
   if (event.key === 'h' || event.key === 'H') {
+    hHeld = false
+  }
+  if (event.key === 'Meta' || event.key === 'Control') {
+    bHeld = false
     hHeld = false
   }
 })
@@ -3290,7 +3105,7 @@ inputEl.addEventListener('paste', (event) => {
   if (editingId) return
   if (inputEl.value.trim() !== '') return
 
-  // Hold H: let the browser paste into the composer without auto-submitting.
+  // ⌘V H: let the browser paste into the composer without auto-submitting.
   if (hHeld) return
 
   const text = event.clipboardData?.getData('text/plain') ?? ''
@@ -3316,20 +3131,8 @@ settingsCloseEl.addEventListener('click', () => {
   closeSettings()
 })
 
-viewModeSegmentEl.addEventListener('click', (event) => {
-  const item = event.target.closest('[data-view-mode]')
-  if (!item || !viewModeSegmentEl.contains(item)) return
-  setViewMode(item.dataset.viewMode)
-})
-
 showWeekdayEl.addEventListener('change', () => {
   setShowWeekday(showWeekdayEl.checked)
-})
-
-journalTabsEl.addEventListener('click', (event) => {
-  const tab = event.target.closest('[data-action="select-journal"]')
-  if (!tab || !journalTabsEl.contains(tab)) return
-  selectJournal(tab.dataset.journalId)
 })
 
 contextMenuEl.addEventListener('click', (event) => {
@@ -3344,8 +3147,6 @@ contextMenuEl.addEventListener('click', (event) => {
 })
 
 sidebarEl.addEventListener('contextmenu', (event) => {
-  if (settings.viewMode !== VIEW_MODE_TIMELINE) return
-
   const journalEl = event.target.closest('.sidebar-journal[data-journal-id]')
   if (!journalEl || !sidebarEl.contains(journalEl)) return
 
@@ -3366,13 +3167,6 @@ feedEl.addEventListener('contextmenu', (event) => {
 })
 
 sidebarEl.addEventListener('click', (event) => {
-  const dayButton = event.target.closest('[data-day-key]')
-  if (dayButton && sidebarEl.contains(dayButton)) {
-    selectedDayKey = dayButton.dataset.dayKey
-    render({ preserveScroll: true })
-    return
-  }
-
   const actionButton = event.target.closest('[data-action]')
   if (!actionButton || !sidebarEl.contains(actionButton)) return
 
@@ -3435,8 +3229,6 @@ sidebarEl.addEventListener('click', (event) => {
 })
 
 sidebarEl.addEventListener('dragstart', (event) => {
-  if (settings.viewMode !== VIEW_MODE_TIMELINE) return
-
   const row = event.target.closest('.sidebar-journal[data-journal-id]')
   if (!row || !sidebarEl.contains(row)) return
 

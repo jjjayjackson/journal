@@ -11,7 +11,7 @@
   <main class="app" id="app">
     <aside class="sidebar" id="sidebar" aria-label="Navigation"></aside>
     <div class="main-column">
-      <div class="top-actions" role="toolbar" aria-label="Views">
+      <div class="top-actions" role="toolbar" aria-label="Settings">
         <button
           type="button"
           class="top-action-btn"
@@ -44,7 +44,6 @@
       </div>
 
       <div class="journal-view" id="journal-view">
-        <nav class="journal-tabs" id="journal-tabs" aria-label="Journals" hidden></nav>
         <div class="feed" id="feed" aria-live="polite"></div>
         <form class="composer" id="composer">
           <div class="composer-quote" id="composer-quote" hidden>
@@ -104,42 +103,6 @@
           <h2 class="settings-heading">Settings</h2>
         </header>
         <div class="settings-menu" id="settings-menu">
-          <div class="settings-card" id="view-mode-settings">
-            <div class="settings-card-copy">
-              <span class="settings-menu-label" id="view-mode-label">View</span>
-              <span class="settings-menu-desc">
-                Timeline scrolls every day in one feed. Date picks a day from the sidebar.
-              </span>
-            </div>
-            <div
-              class="settings-segment"
-              id="view-mode-segment"
-              role="radiogroup"
-              aria-labelledby="view-mode-label"
-            >
-              <button
-                type="button"
-                class="settings-segment-option"
-                role="radio"
-                data-view-mode="timeline"
-                aria-checked="false"
-              >
-                Timeline
-                <kbd class="settings-kbd">T</kbd>
-              </button>
-              <button
-                type="button"
-                class="settings-segment-option"
-                role="radio"
-                data-view-mode="day"
-                aria-checked="false"
-              >
-                Date
-                <kbd class="settings-kbd">D</kbd>
-              </button>
-            </div>
-          </div>
-
           <div class="settings-card" id="weekday-settings">
             <div class="settings-card-row">
               <div class="settings-card-copy">
@@ -158,6 +121,25 @@
                   <span class="settings-switch-thumb"></span>
                 </span>
               </label>
+            </div>
+          </div>
+          <div class="settings-card" id="shortcut-settings">
+            <span class="settings-menu-label">Shortcuts</span>
+            <div class="settings-shortcut-row">
+              <span class="settings-menu-desc">Paste and backdate</span>
+              <span class="settings-keys" aria-label="Command V B">
+                <kbd>⌘</kbd>
+                <kbd>V</kbd>
+                <kbd>B</kbd>
+              </span>
+            </div>
+            <div class="settings-shortcut-row">
+              <span class="settings-menu-desc">Paste without posting</span>
+              <span class="settings-keys" aria-label="Command V H">
+                <kbd>⌘</kbd>
+                <kbd>V</kbd>
+                <kbd>H</kbd>
+              </span>
             </div>
           </div>
         </div>
