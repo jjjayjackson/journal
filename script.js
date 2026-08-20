@@ -26,6 +26,9 @@ const supabase = window.supabase.createClient(
   },
 )
 
+const attachments = window.EcosystemAttachments.create(supabase)
+const OWNER = attachments.OWNER
+
 let journalPersistTimer = null
 let journalPersistChain = Promise.resolve()
 /** Explicit remote deletes only — never wipe unknown remote rows (e.g. Draft transfers). */
@@ -871,6 +874,7 @@ async function boot() {
   settings = loaded.settings
   entries = loaded.entries
   syncCollapsedFolderIdsFromSettings()
+  await hydrateJournalAttachments()
 
   if (seedJournalLastUsedFromEntries()) {
     saveSettings()
@@ -908,10 +912,35 @@ async function mergeRemoteTransfers() {
       }
     }
 
-    if (incoming.length === 0) return false
+    if (incoming.length > 0) {
+      entries = [...entries, ...incoming]
+      writeEntriesLocal()
+    }
 
-    entries = [...entries, ...incoming]
-    writeEntriesLocal()
+    const hydrateIds = [
+      ...incoming.map((entry) => entry.id),
+      ...entries
+        .filter((entry) => {
+          if (!entry.transferredFrom) return false
+          if (attachments.getCached(OWNER.journalEntry, entry.id).length > 0) return false
+          const transferredMs = Date.parse(entry.transferredFrom.transferredAt || '')
+          return Number.isFinite(transferredMs) && Date.now() - transferredMs < 120000
+        })
+        .map((entry) => entry.id),
+    ]
+    const uniqueHydrateIds = [...new Set(hydrateIds)]
+    if (uniqueHydrateIds.length > 0) {
+      await hydrateJournalAttachments(uniqueHydrateIds)
+    }
+
+    if (incoming.length === 0) {
+      const landed = uniqueHydrateIds.some(
+        (id) => attachments.getCached(OWNER.journalEntry, id).length > 0,
+      )
+      if (landed) render()
+      return landed
+    }
+
     render()
     return true
   } catch (err) {
@@ -1494,11 +1523,20 @@ function copyEntryToJournal(entryId, targetJournalId) {
 
   entries.push(copy)
 
-  targetJournal.lastUsedAt = new Date().toISOString()
-  lastMarkedUsedJournalId = targetJournalId
-
-  saveEntries()
-  focusEntryInJournal(copy.id, targetJournalId)
+  void attachments
+    .copyLinks({
+      fromType: OWNER.journalEntry,
+      fromId: source.id,
+      toType: OWNER.journalEntry,
+      toId: copy.id,
+    })
+    .catch((err) => console.error('Failed to copy attachments:', err))
+    .finally(() => {
+      targetJournal.lastUsedAt = new Date().toISOString()
+      lastMarkedUsedJournalId = targetJournalId
+      saveEntries()
+      focusEntryInJournal(copy.id, targetJournalId)
+    })
 }
 
 function moveEntryToJournal(entryId, targetJournalId) {
@@ -2092,9 +2130,46 @@ function startEdit(id) {
   markJournalUsed(entry.journalId || settings.selectedJournalId)
 }
 
+function enhanceEntryAttachments() {
+  for (const el of feedEl.querySelectorAll('.entry[data-id]')) {
+    if (el.querySelector('.eco-attach-strip')) continue
+    const body = el.querySelector('.entry-body')
+    if (!body) continue
+    const items = attachments.getCached(OWNER.journalEntry, el.dataset.id)
+    if (items.length === 0) continue
+    const strip = attachments.createStrip(items)
+    const textEl = body.querySelector('.entry-text')
+    if (textEl) textEl.after(strip)
+    else body.appendChild(strip)
+  }
+}
+
+async function hydrateJournalAttachments(entryIds = entries.map((entry) => entry.id)) {
+  try {
+    await attachments.hydrate(OWNER.journalEntry, entryIds)
+  } catch (err) {
+    console.warn('Failed to load journal attachments:', err)
+  }
+}
+
+async function unlinkJournalAttachments(entryIds) {
+  for (const id of entryIds) {
+    try {
+      await attachments.unlinkOwner({
+        ownerType: OWNER.journalEntry,
+        ownerId: id,
+        cleanup: true,
+      })
+    } catch (err) {
+      console.warn('Failed to clean up journal attachments:', err)
+    }
+  }
+}
+
 function deleteEntry(id) {
   entries = entries.filter((item) => item.id !== id)
   queueRemoteDelete(id)
+  void unlinkJournalAttachments([id])
   if (editingId === id) {
     editingId = null
     inputEl.value = ''
@@ -2301,6 +2376,7 @@ function deleteJournal(journalId) {
     .filter((entry) => entry.journalId === journalId)
     .map((entry) => entry.id)
   queueRemoteDeletes(removedIds)
+  void unlinkJournalAttachments(removedIds)
   entries = entries.filter((entry) => entry.journalId !== journalId)
 
   if (settings.selectedJournalId === journalId) {
@@ -2347,6 +2423,7 @@ function deleteFolder(folderId) {
     .filter((entry) => journalIdSet.has(entry.journalId))
     .map((entry) => entry.id)
   queueRemoteDeletes(removedIds)
+  void unlinkJournalAttachments(removedIds)
   entries = entries.filter((entry) => !journalIdSet.has(entry.journalId))
 
   for (const id of folderIds) {
@@ -2884,6 +2961,7 @@ function render({ preserveScroll = false } = {}) {
   feedEl.scrollTop = preserveScroll ? scrollTop : feedEl.scrollHeight
 
   enhanceCollapsibleQuotes()
+  enhanceEntryAttachments()
 
   // Clear transfer enter flags after this paint so re-renders don't replay.
   if (pendingTransferEnterIds.size > 0) {

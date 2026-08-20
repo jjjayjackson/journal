@@ -767,6 +767,15 @@ body {
   word-break: break-word;
 }
 
+.entry-body > .eco-attach-strip {
+  margin-top: 0.15rem;
+}
+
+.entry-body .eco-attach-item {
+  width: 5rem;
+  height: 5rem;
+}
+
 .entry-quote {
   display: flex;
   flex-direction: column;
