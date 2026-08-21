@@ -1,15 +1,17 @@
-const STORAGE_KEY = 'journal-mvp:entries'
+const STORAGE_KEY = 'river:entries'
+const LEGACY_STORAGE_KEY = 'journal-mvp:entries'
 const ENTRY_KIND_ENTRY = 'entry'
 const ENTRY_KIND_ANNOUNCEMENT = 'announcement'
-const SETTINGS_KEY = 'journal-mvp:settings'
+const SETTINGS_KEY = 'river:settings'
+const LEGACY_SETTINGS_KEY = 'journal-mvp:settings'
 const VIEW_MODE_TIMELINE = 'timeline'
 const DEFAULT_JOURNAL_ID = 'journal-default'
 const PERSIST_DEBOUNCE_MS = 400
 const TRANSFER_POLL_MS = 2500
 
 const supabase = window.supabase.createClient(
-  window.JOURNAL_SUPABASE.url,
-  window.JOURNAL_SUPABASE.anonKey,
+  window.RIVER_SUPABASE.url,
+  window.RIVER_SUPABASE.anonKey,
   {
     // No auth in this MVP — skip session storage so Tracking Prevention
     // (Safari/Edge) can't block the client when the library is third-party.
@@ -28,6 +30,24 @@ const supabase = window.supabase.createClient(
 
 const attachments = window.EcosystemAttachments.create(supabase)
 const OWNER = attachments.OWNER
+
+function readLocalItem(key, legacyKey) {
+  try {
+    const current = localStorage.getItem(key)
+    if (current != null) {
+      if (legacyKey) localStorage.removeItem(legacyKey)
+      return current
+    }
+    if (!legacyKey) return null
+    const legacy = localStorage.getItem(legacyKey)
+    if (legacy == null) return null
+    localStorage.setItem(key, legacy)
+    localStorage.removeItem(legacyKey)
+    return legacy
+  } catch {
+    return null
+  }
+}
 
 let journalPersistTimer = null
 let journalPersistChain = Promise.resolve()
@@ -345,7 +365,7 @@ function loadEntriesFromLocal() {
   const fallbackJournalId = settings.journals[0]?.id ?? DEFAULT_JOURNAL_ID
 
   try {
-    const raw = localStorage.getItem(STORAGE_KEY)
+    const raw = readLocalItem(STORAGE_KEY, LEGACY_STORAGE_KEY)
     if (!raw) return []
     const parsed = JSON.parse(raw)
     if (!Array.isArray(parsed)) return []
@@ -734,7 +754,7 @@ function normalizeSettings(value) {
 
 function loadSettingsFromLocal() {
   try {
-    const raw = localStorage.getItem(SETTINGS_KEY)
+    const raw = readLocalItem(SETTINGS_KEY, LEGACY_SETTINGS_KEY)
     if (!raw) return normalizeSettings(null)
     return normalizeSettings(JSON.parse(raw))
   } catch {
@@ -887,7 +907,7 @@ async function boot() {
 }
 
 /**
- * Pull any journal rows created outside this tab (e.g. Capture → Journal transfers)
+ * Pull any journal rows created outside this tab (e.g. Capture → River transfers)
  * and merge them into local state without wiping local-only pending writes.
  */
 async function mergeRemoteTransfers() {
