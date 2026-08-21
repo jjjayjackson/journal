@@ -4,7 +4,7 @@
  * Files live in Supabase Storage (`attachments` bucket). Postgres stores
  * file metadata (`attachments`) and per-app ownership (`attachment_links`).
  *
- * Drafts, To-Do, and Journal use separate records today, so transfers
+ * Capture, To-Do, and Journal use separate records today, so transfers
  * relink the same attachment_id to the new owner — they never copy the
  * stored file.
  */

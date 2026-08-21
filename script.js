@@ -31,7 +31,7 @@ const OWNER = attachments.OWNER
 
 let journalPersistTimer = null
 let journalPersistChain = Promise.resolve()
-/** Explicit remote deletes only — never wipe unknown remote rows (e.g. Draft transfers). */
+/** Explicit remote deletes only — never wipe unknown remote rows (e.g. Capture transfers). */
 /** @type {Set<string>} */
 const pendingRemoteDeletes = new Set()
 /** Entry ids that should slide in from the left on next paint. */
@@ -887,7 +887,7 @@ async function boot() {
 }
 
 /**
- * Pull any journal rows created outside this tab (e.g. Drafts → Journal transfers)
+ * Pull any journal rows created outside this tab (e.g. Capture → Journal transfers)
  * and merge them into local state without wiping local-only pending writes.
  */
 async function mergeRemoteTransfers() {
@@ -1748,8 +1748,14 @@ function formatTransferStamp(iso) {
   return `${month}.${day}.${year} ${hours}${minutes}`
 }
 
+function displaySourceAppName(sourceApp) {
+  const name = typeof sourceApp === 'string' ? sourceApp.trim() : ''
+  if (name === 'Drafts' || name === 'Drafts MVP') return 'Capture'
+  return name
+}
+
 function formatTransferredFromNote(transferredFrom) {
-  const sourceApp = transferredFrom?.sourceApp?.trim() || 'another app'
+  const sourceApp = displaySourceAppName(transferredFrom?.sourceApp) || 'another app'
   const transferredStamp = transferredFrom?.transferredAt
     ? formatTransferStamp(transferredFrom.transferredAt)
     : ''
