@@ -4,10 +4,13 @@ const ENTRY_KIND_ENTRY = 'entry'
 const ENTRY_KIND_ANNOUNCEMENT = 'announcement'
 const SETTINGS_KEY = 'river:settings'
 const LEGACY_SETTINGS_KEY = 'journal-mvp:settings'
+const EXPANDED_ENTRIES_KEY = 'river:expanded-entries'
 const VIEW_MODE_TIMELINE = 'timeline'
 const DEFAULT_JOURNAL_ID = 'journal-default'
 const PERSIST_DEBOUNCE_MS = 400
 const TRANSFER_POLL_MS = 2500
+const COMPOSER_INDENT = '    '
+const COMPOSER_INDENT_SIZE = COMPOSER_INDENT.length
 
 const supabase = window.supabase.createClient(
   window.RIVER_SUPABASE.url,
@@ -76,6 +79,7 @@ const settingsOpenEl = document.getElementById('settings-open')
 const settingsCloseEl = document.getElementById('settings-close')
 const settingsViewEl = document.getElementById('settings-view')
 const showWeekdayEl = document.getElementById('show-weekday')
+const entryWidthEl = document.getElementById('entry-width')
 const nameSheetEl = document.getElementById('name-sheet')
 const nameTitleEl = document.getElementById('name-title')
 const nameInputEl = document.getElementById('name-input')
@@ -88,6 +92,9 @@ const backdateDatetimeEl = document.getElementById('backdate-datetime')
 const backdateCancelEl = document.getElementById('backdate-cancel')
 const backdateConfirmEl = document.getElementById('backdate-confirm')
 const contextMenuEl = document.getElementById('context-menu')
+const thoughtChainEl = document.getElementById('thought-chain')
+const thoughtChainListEl = document.getElementById('thought-chain-list')
+const thoughtChainCloseEl = document.getElementById('thought-chain-close')
 
 let settings = normalizeSettings(null)
 let entries = []
@@ -108,9 +115,16 @@ let contextMenuEntryId = null
 let historyEntryId = null
 /** Expanded history row index within the open panel, or null. */
 let historyExpandedIndex = null
+/** Entry from which the thought-chain panel was opened. */
+let chainEntryId = null
+/** Scroll the origin item into view after the next chain paint. */
+let chainScrollToOrigin = false
 /** Entry ids whose quoted text is fully expanded. */
 /** @type {Set<string>} */
 const expandedQuoteIds = new Set()
+/** Entry ids whose body text is fully expanded. */
+/** @type {Set<string>} */
+const expandedEntryIds = new Set()
 /** Whether the composer quote preview is fully expanded. */
 let composerQuoteExpanded = false
 /** Avoid re-touching the same journal on every composer keystroke. */
@@ -485,6 +499,9 @@ function isDefaultRemoteSeed(folders, journals, settingsRow, entryCount) {
   if (settingsRow.view_mode !== VIEW_MODE_TIMELINE) return false
   if (settingsRow.selected_journal_id !== DEFAULT_JOURNAL_ID) return false
   if (settingsRow.show_weekday === true) return false
+  if (typeof settingsRow.entry_width === 'number' && settingsRow.entry_width > 0) {
+    return false
+  }
   const collapsed = settingsRow.collapsed_folder_ids
   if (Array.isArray(collapsed) && collapsed.length > 0) return false
   return true
@@ -525,6 +542,10 @@ async function loadJournalStateFromSupabase() {
       typeof settingsRow?.show_weekday === 'boolean'
         ? settingsRow.show_weekday
         : localSettings.showWeekday,
+    entryWidth:
+      typeof settingsRow?.entry_width === 'number'
+        ? settingsRow.entry_width
+        : localSettings.entryWidth,
     folders,
     journals,
     selectedJournalId: settingsRow?.selected_journal_id,
@@ -632,18 +653,26 @@ async function persistSettingsToSupabase(nextSettings = settings) {
     id: 1,
     view_mode: VIEW_MODE_TIMELINE,
     show_weekday: !!nextSettings.showWeekday,
+    entry_width: normalizeEntryWidth(nextSettings.entryWidth),
     selected_journal_id: nextSettings.selectedJournalId,
     collapsed_folder_ids: nextSettings.collapsedFolderIds || [],
     updated_at: new Date().toISOString(),
   }
-  let { error: settingsError } = await supabase
-    .from('journal_settings')
-    .upsert(settingsPayload)
-  if (settingsError && /show_weekday/i.test(settingsError.message || '')) {
-    const { show_weekday, ...withoutWeekday } = settingsPayload
+  const optionalSettingKeys = ['show_weekday', 'entry_width']
+  let payload = settingsPayload
+  let settingsError = null
+  for (let attempt = 0; attempt <= optionalSettingKeys.length; attempt += 1) {
     ;({ error: settingsError } = await supabase
       .from('journal_settings')
-      .upsert(withoutWeekday))
+      .upsert(payload))
+    if (!settingsError) break
+    const message = settingsError.message || ''
+    const missingKey = optionalSettingKeys.find(
+      (key) => key in payload && new RegExp(key, 'i').test(message),
+    )
+    if (!missingKey) break
+    const { [missingKey]: _dropped, ...rest } = payload
+    payload = rest
   }
   if (settingsError) throw settingsError
 
@@ -696,8 +725,15 @@ function saveEntries() {
   queueJournalPersist()
 }
 
+function normalizeEntryWidth(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return 0
+  return Math.min(100, Math.max(0, Math.round(n)))
+}
+
 function normalizeSettings(value) {
   const showWeekday = value?.showWeekday === true
+  const entryWidth = normalizeEntryWidth(value?.entryWidth)
 
   let folders = Array.isArray(value?.folders)
     ? value.folders.map(normalizeFolder).filter(Boolean)
@@ -745,6 +781,7 @@ function normalizeSettings(value) {
 
   return {
     showWeekday,
+    entryWidth,
     folders,
     journals,
     selectedJournalId,
@@ -786,6 +823,7 @@ function localHasJournalData() {
   const hasFolders = localSettings.folders.length > 0
   const hasCustomSettings =
     localSettings.showWeekday ||
+    localSettings.entryWidth > 0 ||
     localSettings.selectedJournalId !== DEFAULT_JOURNAL_ID ||
     localSettings.collapsedFolderIds.length > 0
 
@@ -893,7 +931,9 @@ async function boot() {
   const loaded = await loadJournalState()
   settings = loaded.settings
   entries = loaded.entries
+  applyEntryWidth()
   syncCollapsedFolderIdsFromSettings()
+  syncExpandedEntryIdsFromLocal()
   await hydrateJournalAttachments()
 
   if (seedJournalLastUsedFromEntries()) {
@@ -1020,9 +1060,6 @@ function createAnnouncementEntry(journalId, text, createdAt = new Date().toISOSt
 }
 
 function getEntryQuoteSnapshot(entry) {
-  if (entry.quote?.text) {
-    return `${entry.quote.text}\n\n${entry.text}`
-  }
   return entry.text
 }
 
@@ -1109,6 +1146,30 @@ function createFolder(name, parentId = null) {
 function persistCollapsedFolders() {
   settings.collapsedFolderIds = [...collapsedFolderIds]
   saveSettings()
+}
+
+function syncExpandedEntryIdsFromLocal() {
+  expandedEntryIds.clear()
+  try {
+    const raw = localStorage.getItem(EXPANDED_ENTRIES_KEY)
+    if (!raw) return
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return
+    for (const id of parsed) {
+      if (typeof id === 'string' && id) expandedEntryIds.add(id)
+    }
+  } catch {
+    expandedEntryIds.clear()
+  }
+}
+
+function persistExpandedEntryIds() {
+  try {
+    localStorage.setItem(
+      EXPANDED_ENTRIES_KEY,
+      JSON.stringify([...expandedEntryIds]),
+    )
+  } catch {}
 }
 
 function getChildFolders(parentId) {
@@ -1428,6 +1489,12 @@ function openEntryContextMenu(entryId, clientX, clientY) {
       role="menuitem"
       data-action="build-on"
     >Build on</button>
+    <button
+      type="button"
+      class="context-menu-item"
+      role="menuitem"
+      data-action="thought-chain"
+    >View thought chain</button>
     ${
       entry.history?.length
         ? `<button
@@ -1624,6 +1691,8 @@ function handleContextMenuAction(action, folderId, targetJournalId) {
       startEdit(entryId)
     } else if (action === 'build-on') {
       startBuildOn(entryId)
+    } else if (action === 'thought-chain') {
+      toggleThoughtChain(entryId)
     } else if (action === 'history') {
       toggleEntryHistory(entryId)
     } else if (action === 'delete') {
@@ -1970,6 +2039,123 @@ function toggleHistoryItem(entryId, index) {
   render({ preserveScroll: true })
 }
 
+function collectThoughtChain(startId) {
+  const byId = new Map()
+  const childrenBySource = new Map()
+
+  for (const entry of entries) {
+    if (isAnnouncementEntry(entry)) continue
+    byId.set(entry.id, entry)
+    const sourceId = entry.quote?.sourceId
+    if (!sourceId) continue
+    const children = childrenBySource.get(sourceId)
+    if (children) children.push(entry.id)
+    else childrenBySource.set(sourceId, [entry.id])
+  }
+
+  const visited = new Set()
+  const stack = [startId]
+
+  while (stack.length) {
+    const id = stack.pop()
+    if (!id || visited.has(id)) continue
+    visited.add(id)
+
+    const entry = byId.get(id)
+    if (entry?.quote?.sourceId) stack.push(entry.quote.sourceId)
+
+    const children = childrenBySource.get(id)
+    if (children) {
+      for (const childId of children) stack.push(childId)
+    }
+  }
+
+  return [...visited]
+    .map((id) => byId.get(id))
+    .filter(Boolean)
+    .sort((a, b) => {
+      const delta = new Date(a.createdAt) - new Date(b.createdAt)
+      if (delta !== 0) return delta
+      return a.id.localeCompare(b.id)
+    })
+}
+
+function closeThoughtChain() {
+  if (!chainEntryId) return
+  chainEntryId = null
+  chainScrollToOrigin = false
+  render({ preserveScroll: true })
+}
+
+function openThoughtChain(entryId) {
+  const entry = entries.find((item) => item.id === entryId)
+  if (!entry || isAnnouncementEntry(entry)) return
+
+  chainEntryId = entryId
+  chainScrollToOrigin = true
+  render({ preserveScroll: true })
+}
+
+function toggleThoughtChain(entryId) {
+  if (chainEntryId === entryId) {
+    closeThoughtChain()
+    return
+  }
+  openThoughtChain(entryId)
+}
+
+function renderThoughtChainItem(entry) {
+  const date = new Date(entry.createdAt)
+  const isOrigin = entry.id === chainEntryId
+  return `
+    <button
+      type="button"
+      class="chain-item${isOrigin ? ' is-origin' : ''}"
+      data-entry-id="${escapeHtml(entry.id)}"
+      ${isOrigin ? 'aria-current="true"' : ''}
+    >
+      <span class="chain-track" aria-hidden="true">
+        <span class="chain-node"></span>
+      </span>
+      <span class="chain-body">
+        <span class="chain-date">${escapeHtml(formatDayHeader(date))}</span>
+        <span class="chain-time">${escapeHtml(formatEntryTime(date))}</span>
+        <span class="chain-text">${escapeHtml(entry.text)}</span>
+      </span>
+    </button>
+  `
+}
+
+function renderThoughtChain() {
+  if (!chainEntryId) {
+    thoughtChainEl.hidden = true
+    thoughtChainListEl.innerHTML = ''
+    return
+  }
+
+  const origin = entries.find((item) => item.id === chainEntryId)
+  if (!origin || isAnnouncementEntry(origin)) {
+    chainEntryId = null
+    chainScrollToOrigin = false
+    thoughtChainEl.hidden = true
+    thoughtChainListEl.innerHTML = ''
+    return
+  }
+
+  const scrollTop = thoughtChainListEl.scrollTop
+  const chain = collectThoughtChain(chainEntryId)
+  thoughtChainEl.hidden = false
+  thoughtChainListEl.innerHTML = chain.map(renderThoughtChainItem).join('')
+
+  if (chainScrollToOrigin) {
+    chainScrollToOrigin = false
+    const originEl = thoughtChainListEl.querySelector('.chain-item.is-origin')
+    originEl?.scrollIntoView({ block: 'center', inline: 'nearest' })
+  } else {
+    thoughtChainListEl.scrollTop = scrollTop
+  }
+}
+
 function toDatetimeLocalValue(date) {
   const year = date.getFullYear()
   const month = String(date.getMonth() + 1).padStart(2, '0')
@@ -2031,6 +2217,83 @@ function ensureSelectedJournal() {
 function resizeComposer() {
   inputEl.style.height = 'auto'
   inputEl.style.height = `${inputEl.scrollHeight}px`
+}
+
+function insertComposerText(text) {
+  if (document.execCommand('insertText', false, text)) return
+  const start = inputEl.selectionStart
+  const end = inputEl.selectionEnd
+  inputEl.setRangeText(text, start, end, 'end')
+}
+
+function indentComposer() {
+  insertComposerText(COMPOSER_INDENT)
+}
+
+function leadingIndentToRemove(value, lineStart, lineEnd) {
+  if (lineStart >= lineEnd) return 0
+  if (value[lineStart] === '\t') return 1
+  let count = 0
+  while (
+    count < COMPOSER_INDENT_SIZE &&
+    lineStart + count < lineEnd &&
+    value[lineStart + count] === ' '
+  ) {
+    count += 1
+  }
+  return count
+}
+
+function unindentComposer() {
+  const value = inputEl.value
+  const selStart = inputEl.selectionStart
+  const selEnd = inputEl.selectionEnd
+  const blockStart = value.lastIndexOf('\n', selStart - 1) + 1
+  let blockEnd = selEnd
+  if (selEnd > selStart && value[selEnd - 1] === '\n') {
+    blockEnd = selEnd - 1
+  }
+
+  /** @type {Array<{ start: number, count: number }>} */
+  const removals = []
+  let lineStart = blockStart
+  while (lineStart <= blockEnd) {
+    const nl = value.indexOf('\n', lineStart)
+    const lineEnd = nl === -1 ? value.length : nl
+    const count = leadingIndentToRemove(value, lineStart, lineEnd)
+    if (count > 0) removals.push({ start: lineStart, count })
+    if (nl === -1) break
+    lineStart = nl + 1
+    if (lineStart > blockEnd) break
+  }
+  if (removals.length === 0) return
+
+  /**
+   * @param {number} offset
+   */
+  function shifted(offset) {
+    let next = offset
+    for (const { start, count } of removals) {
+      if (offset <= start) break
+      next -= Math.min(count, offset - start)
+    }
+    return next
+  }
+
+  for (let i = removals.length - 1; i >= 0; i--) {
+    const { start, count } = removals[i]
+    inputEl.setSelectionRange(start, start + count)
+    if (!document.execCommand('delete')) {
+      inputEl.setRangeText('', start, start + count, 'end')
+    }
+  }
+
+  if (selStart === selEnd) {
+    const caret = shifted(selStart)
+    inputEl.setSelectionRange(caret, caret)
+  } else {
+    inputEl.setSelectionRange(shifted(selStart), shifted(selEnd))
+  }
 }
 
 function resetComposerHeight() {
@@ -2164,8 +2427,10 @@ function enhanceEntryAttachments() {
     const items = attachments.getCached(OWNER.journalEntry, el.dataset.id)
     if (items.length === 0) continue
     const strip = attachments.createStrip(items)
+    const textBlock = body.querySelector('.entry-text-block')
     const textEl = body.querySelector('.entry-text')
-    if (textEl) textEl.after(strip)
+    if (textBlock) textBlock.after(strip)
+    else if (textEl) textEl.after(strip)
     else body.appendChild(strip)
   }
 }
@@ -2208,7 +2473,12 @@ function deleteEntry(id) {
     historyEntryId = null
     historyExpandedIndex = null
   }
+  if (chainEntryId === id) {
+    chainEntryId = null
+    chainScrollToOrigin = false
+  }
   expandedQuoteIds.delete(id)
+  if (expandedEntryIds.delete(id)) persistExpandedEntryIds()
   saveEntries()
   render()
 }
@@ -2608,6 +2878,48 @@ function toggleQuoteExpand(entryId) {
   render({ preserveScroll: true })
 }
 
+function enhanceCollapsibleEntries() {
+  for (const block of feedEl.querySelectorAll('[data-text-clamp]')) {
+    const clamp = block.querySelector('.entry-text-clamp')
+    const toggle = block.querySelector('[data-action="toggle-entry-text"]')
+    if (!clamp || !toggle) continue
+
+    const entryId = block.closest('.entry')?.dataset.id
+    if (!entryId) continue
+
+    clamp.classList.remove('is-expanded')
+    block.classList.remove('is-expanded', 'is-collapsible')
+    const overflows = clamp.scrollHeight > clamp.clientHeight + 1
+
+    if (!overflows) {
+      clamp.classList.add('is-expanded')
+      toggle.hidden = true
+      toggle.textContent = 'More'
+      toggle.setAttribute('aria-expanded', 'false')
+      continue
+    }
+
+    const expanded = expandedEntryIds.has(entryId)
+    block.classList.add('is-collapsible')
+    block.classList.toggle('is-expanded', expanded)
+    clamp.classList.toggle('is-expanded', expanded)
+    toggle.hidden = false
+    toggle.textContent = expanded ? 'Less' : 'More'
+    toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false')
+  }
+}
+
+function toggleEntryTextExpand(entryId) {
+  if (!entryId) return
+  if (expandedEntryIds.has(entryId)) {
+    expandedEntryIds.delete(entryId)
+  } else {
+    expandedEntryIds.add(entryId)
+  }
+  persistExpandedEntryIds()
+  render({ preserveScroll: true })
+}
+
 /** @type {ReturnType<typeof setTimeout> | null} */
 let highlightEntryTimer = null
 
@@ -2796,6 +3108,8 @@ function renderEntry(entry) {
   const transferEnterClass = pendingTransferEnterIds.has(entry.id)
     ? ' is-transfer-enter'
     : ''
+  const textExpanded = expandedEntryIds.has(entry.id)
+  const textExpandedClass = textExpanded ? ' is-expanded' : ''
   return `
     <article class="entry${historyEntryId === entry.id ? ' is-history-open' : ''}${transferEnterClass}" data-id="${escapeHtml(entry.id)}">
       <div class="entry-actions">
@@ -2822,7 +3136,21 @@ function renderEntry(entry) {
         ${movedFromHtml}
         ${transferredFromHtml}
         ${quoteHtml}
-        <p class="entry-text">${escapeHtml(entry.text)}</p>
+        <div
+          class="entry-text-block${textExpandedClass}"
+          data-text-clamp
+        >
+          <div class="entry-text-clamp${textExpandedClass}">
+            <p class="entry-text">${escapeHtml(entry.text)}</p>
+          </div>
+          <button
+            type="button"
+            class="entry-text-toggle"
+            data-action="toggle-entry-text"
+            aria-expanded="${textExpanded ? 'true' : 'false'}"
+            hidden
+          >${textExpanded ? 'Less' : 'More'}</button>
+        </div>
         ${historyHtml}
       </div>
     </article>
@@ -2963,11 +3291,14 @@ function renderFeed(groups) {
 
 function syncSettingsUi() {
   showWeekdayEl.checked = !!settings.showWeekday
+  entryWidthEl.value = String(settings.entryWidth)
+  applyEntryWidth()
 }
 
 function render({ preserveScroll = false } = {}) {
   const scrollTop = feedEl.scrollTop
   ensureSelectedJournal()
+  applyEntryWidth()
 
   const showSettings = currentView === 'settings'
   appEl.classList.toggle('is-settings-mode', showSettings)
@@ -2975,6 +3306,8 @@ function render({ preserveScroll = false } = {}) {
   settingsCloseEl.hidden = !showSettings
   settingsViewEl.hidden = !showSettings
   journalViewEl.hidden = showSettings
+
+  renderThoughtChain()
 
   if (showSettings) {
     syncSettingsUi()
@@ -2987,6 +3320,7 @@ function render({ preserveScroll = false } = {}) {
   feedEl.scrollTop = preserveScroll ? scrollTop : feedEl.scrollHeight
 
   enhanceCollapsibleQuotes()
+  enhanceCollapsibleEntries()
   enhanceEntryAttachments()
 
   // Clear transfer enter flags after this paint so re-renders don't replay.
@@ -3032,27 +3366,46 @@ function setShowWeekday(enabled) {
   }
 }
 
+function applyEntryWidth() {
+  const t = normalizeEntryWidth(settings.entryWidth) / 100
+  document.documentElement.style.setProperty('--entry-width-t', String(t))
+}
+
+function setEntryWidth(value) {
+  const next = normalizeEntryWidth(value)
+  settings.entryWidth = next
+  applyEntryWidth()
+  entryWidthEl.value = String(next)
+  saveSettings()
+}
+
+function normalizeEntryText(text) {
+  const value = String(text ?? '')
+  if (!value.trim()) return ''
+  return value.trimEnd()
+}
+
 function submitEntry(text = inputEl.value) {
-  const trimmed = text.trim()
-  if (!trimmed) return
+  const next = normalizeEntryText(text)
+  if (!next) return
 
   markJournalUsed(settings.selectedJournalId)
 
   if (editingId) {
     const entry = entries.find((item) => item.id === editingId)
     if (entry) {
-      if (entry.text !== trimmed) {
+      if (entry.text !== next) {
         if (!Array.isArray(entry.history)) entry.history = []
         entry.history.push({
           editedAt: new Date().toISOString(),
           text: entry.text,
         })
-        entry.text = trimmed
+        entry.text = next
       }
     }
     editingId = null
   } else {
-    const entry = createEntry(trimmed, new Date().toISOString(), pendingQuote)
+    const entry = createEntry(next, new Date().toISOString(), pendingQuote)
     entries.push(entry)
     clearPendingQuote()
   }
@@ -3074,8 +3427,8 @@ function pasteIntoComposer(text) {
 }
 
 function submitPastedText(text) {
-  const trimmed = text.trim()
-  if (!trimmed) return
+  const next = normalizeEntryText(text)
+  if (!next) return
 
   if (hHeld) {
     pasteIntoComposer(text)
@@ -3086,7 +3439,7 @@ function submitPastedText(text) {
     markJournalUsed(settings.selectedJournalId)
     openBackdateSheet({
       mode: 'create',
-      text: trimmed,
+      text: next,
       createdAt: new Date().toISOString(),
       quote: pendingQuote,
     })
@@ -3094,7 +3447,7 @@ function submitPastedText(text) {
   }
 
   markJournalUsed(settings.selectedJournalId)
-  const entry = createEntry(trimmed, new Date().toISOString(), pendingQuote)
+  const entry = createEntry(next, new Date().toISOString(), pendingQuote)
   entries.push(entry)
   clearPendingQuote()
   saveEntries()
@@ -3144,6 +3497,12 @@ document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && currentView === 'settings') {
     event.preventDefault()
     closeSettings()
+    return
+  }
+
+  if (event.key === 'Escape' && chainEntryId) {
+    event.preventDefault()
+    closeThoughtChain()
     return
   }
 
@@ -3200,6 +3559,13 @@ document.addEventListener('pointerdown', (event) => {
 })
 
 inputEl.addEventListener('keydown', (event) => {
+  if (event.key === 'Tab' && !event.metaKey && !event.ctrlKey && !event.altKey) {
+    event.preventDefault()
+    if (event.shiftKey) unindentComposer()
+    else indentComposer()
+    return
+  }
+
   if (event.key !== 'Enter' || event.shiftKey) return
   event.preventDefault()
   submitEntry()
@@ -3235,8 +3601,23 @@ settingsCloseEl.addEventListener('click', () => {
   closeSettings()
 })
 
+thoughtChainCloseEl.addEventListener('click', () => {
+  closeThoughtChain()
+})
+
+thoughtChainListEl.addEventListener('click', (event) => {
+  const item = event.target.closest('.chain-item')
+  if (!item || !thoughtChainListEl.contains(item)) return
+  const entryId = item.dataset.entryId
+  if (entryId) jumpToQuotedEntry(entryId)
+})
+
 showWeekdayEl.addEventListener('change', () => {
   setShowWeekday(showWeekdayEl.checked)
+})
+
+entryWidthEl.addEventListener('input', () => {
+  setEntryWidth(entryWidthEl.value)
 })
 
 contextMenuEl.addEventListener('click', (event) => {
@@ -3443,6 +3824,9 @@ feedEl.addEventListener('click', (event) => {
   } else if (action === 'toggle-quote') {
     event.stopPropagation()
     toggleQuoteExpand(id)
+  } else if (action === 'toggle-entry-text') {
+    event.stopPropagation()
+    toggleEntryTextExpand(id)
   } else if (action === 'jump-quote') {
     const entry = entries.find((item) => item.id === id)
     if (entry?.quote?.sourceId) jumpToQuotedEntry(entry.quote.sourceId)
